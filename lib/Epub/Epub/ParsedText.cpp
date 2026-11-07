@@ -645,7 +645,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
       }
 
       // Target 45% for 1-bold at 4 chars and 3-bold at 7 chars with floor truncation
-      constexpr size_t FOCUS_READING_PERCENT = 45;
+      constexpr size_t FOCUS_READING_PERCENT = 50;
       size_t targetBoldChars = (charCount * FOCUS_READING_PERCENT) / 100;
       targetBoldChars = std::clamp<size_t>(targetBoldChars, 1, 9);
 
