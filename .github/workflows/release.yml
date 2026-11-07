@@ -60,6 +60,12 @@ jobs:
           version="${RELEASE_TAG#v}"
           configured_version="$(sed -n 's/^version = //p' platformio.ini | head -n1)"
           test "$version" = "$configured_version"
+          
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "latest"
+          enable-cache: false
 
       - name: Install PlatformIO Core
         run: |
