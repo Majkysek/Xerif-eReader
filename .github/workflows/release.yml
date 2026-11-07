@@ -61,11 +61,17 @@ jobs:
         with:
           python-version: '3.14'
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "latest"
-          enable-cache: false
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Ruční spuštění, přeskakuji kontrolu verze."
+            exit 0
+          fi
+          version="${RELEASE_TAG#v}"
+          configured_version="$(sed -n 's/^version = //p' platformio.ini | head -n1)"
+          test "$version" = "$configured_version"
 
       - name: Install PlatformIO Core
         run: |
