@@ -40,22 +40,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pio_env: gh_release
-            device: x3-x4
-          - pio_env: sticky-gh_release
-            device: sticky
-          - pio_env: x4pro-gh_release
-            device: x4pro
-          - pio_env: papermono-gh_release
-            device: papermono
-          - pio_env: x4c-gh_release
-            device: x4c
-          - pio_env: metalio_eink4-gh_release
-            device: metalio_eink4
-          - pio_env: eego_a4-gh_release
-            device: eego_a4
-          - pio_env: picco-gh_release
-            device: picco
+          - pio_env: slim
+            device: x3
           # picco release-CANDIDATE builds live in release_candidate.yml (which carries a proper pio_env); the legacy release_env/rc_env-only entry here lacked pio_env and broke the release build with UnknownEnvNamesError.
     steps:
       - uses: actions/checkout@v7
