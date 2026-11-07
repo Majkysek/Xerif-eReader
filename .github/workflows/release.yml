@@ -53,18 +53,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          version="${RELEASE_TAG#v}"
-          configured_version="$(sed -n 's/^version = //p' platformio.ini | head -n1)"
-          test "$version" = "$configured_version"
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.14'
-
-      - name: Validate release version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Ruční spuštění, přeskakuji kontrolu verze."
             exit 0
