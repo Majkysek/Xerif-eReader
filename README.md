@@ -16,10 +16,10 @@ naming conflict with [CrossPoint](https://github.com/crosspoint-reader/crosspoin
 the upstream firmware this fork builds on: one name per project, so bug reports, firmware
 files and community discussions always land in the right place.
 
-Nothing changes on your device: books, fonts, settings and reading progress are untouched,
-and OTA keeps updating exactly as before. Firmware flashed before the rename follows the
-repository move transparently, and releases keep shipping both `xpoint-*.bin` and
-`xerif-*.bin` builds so pre-rename devices keep updating. See the
+Nothing changes on your device: books, fonts, settings and reading progress are untouched.
+Firmware on current-generation releases keeps updating over OTA exactly as before; releases
+ship `xerif-*.bin` builds. Very old pre-rename devices (v1.16–v2.10) stop receiving
+over-the-air updates and stay on their current firmware. See the
 [latest release](https://github.com/Belphemur/Xerif-eReader/releases/latest).
 
 **Xerif eReader** is open-source e-reader firmware for ESP32-based devices — community-built,
@@ -64,6 +64,13 @@ first, soak-tested on a real device before it ships. The main differences:
   [Reading statistics](#-reading-statistics).
 - **Signed OTA.** Every release ships an Ed25519-signed manifest that the device
   verifies before flashing — see [Signed OTA updates](#-signed-ota-updates).
+- **Two firmware channels on one device.** Xerif keeps a **stable** slot and a
+  **dev** slot side by side, so you can follow the rolling dev builds without
+  giving up the last stable release — switching between them is one tap, and a
+  held button combo at power-on always boots the stable slot. Installs are routed
+  by source: release-channel firmware lands in the stable slot, dev-channel and
+  PR builds land in the dev slot, and neither update ever overwrites the other
+  one. See [Firmware channels](#-firmware-channels--the-dev-mode).
 - **Fixes land here first.** Reader and device fixes ship in fork releases as
   they are ready, then upstream merges what it wants on its own schedule.
 
@@ -76,17 +83,26 @@ upstream and periodically synced from it.
 
 ### 📖 Reading experience
 
-- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling,
-  hyphenation, kerning, adaptive table layouts, native CJK ruby annotations, chapter
+- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling
+  with sharper picture rendering (detail-preserving downscale; optional local-contrast
+  enhancement under Settings → Reader → Picture Detail), hyphenation, kerning, adaptive
+  table layouts, native CJK ruby annotations, chapter
   navigation, footnotes, bookmarks, go-to-percent, auto page turn, orientation control,
   focus reading, and more.
 - **Dictionary on long-press or touch.** Long-press a word (or tap it on touch devices)
   to get the definition via [StarDict](docs/dictionary.md). No menu detour. The
   long-press action is configurable (dictionary, footnote, …).
+- **Word highlight on long-press** (TTF fonts): the pressed word is drawn
+  inverted in place, so you always see exactly which word the long-press
+  action will act on before it opens.
 - **Time left in the current chapter.** A live "47 min left" estimate in the status bar,
   computed from your real reading speed (220 wpm baseline, 15-sample trimmed mean,
   80–900 wpm clamps — Kindle's algorithm). Show it left, right, or hide it.
 - **Formats**: native handling for `.epub`, `.xtc/.xtch`, `.txt`, and `.bmp`.
+- **Image viewer built in.** JPEG and PNG images from the file browser render
+  with a dedicated e-ink pipeline: detail-preserving downscale and edge-aware
+  processing that keeps text and line art sharp, plus blue-noise dithering for
+  smooth grayscale. Full-quality page images, no washed-out screenshots.
 - **Tilt page turn** (X3 and Sticky).
 
 ### 📊 Reading statistics
@@ -130,7 +146,8 @@ Your e-reader shouldn't dictate your typography. On PSRAM-equipped devices
 (X4 Pro, M5PaperMono), Xerif eReader ships a true vector font engine: take any `.ttf` or
 `.otf` file — from Google Fonts, your OS, or that foundry you've been saving up for —
 copy it to the SD card, and it just works. No firmware reflash, no rebuild, no
-compromises.
+compromises. Not in the mood for file hunting? **Manage Fonts** now offers
+Japanese fonts as direct downloads.
 
 1. Create a folder for your family on the SD card: `/fonts/YourFont/`
    (or `/.fonts/YourFont/` to keep it out of the way).
@@ -198,12 +215,13 @@ releases. All fonts carry the SIL Open Font License (OFL).
 ### 📡 Wireless
 
 - File transfer web UI and WebSocket fast uploads
+- Browse Files shows a **Show File Extensions** setting to toggle extensions on or off in the file browser
 - EPUB Optimizer
 - Web settings UI/API (edit many device settings from the browser)
 - WebDAV handler
 - AP mode (hotspot) and STA mode (join existing Wi-Fi), both with QR helpers
 - Calibre wireless connect flow
-- OPDS browser with saved servers (up to 8), search, pagination, and direct download
+- OPDS browser with saved servers (up to 8), search, pagination, and direct download; hold Back for one second and release in a catalog to return to the main menu
 - OTA update checks and installs from GitHub releases
 - KOReader progress sync
 
@@ -252,6 +270,38 @@ matters most.
 Every release ships a `manifest.json` + Ed25519 signature. The device verifies against
 a key baked into the firmware before flashing; corrupted or tampered updates are
 rejected. Manual flashing still works. See [OTA signing](docs/OTA_SIGNING.md).
+
+### 🧩 Firmware channels & the dev mode
+
+Xerif ships two firmware channels side by side on the same device, stored in two
+OTA slots with fixed roles:
+
+- **Stable slot** — the last official release, marked `Latest` on GitHub. What a
+  device falls back to.
+- **Dev slot** — the rolling dev builds produced automatically from every commit
+  that passes the full CI matrix, stamped with the exact version it was built
+  from (`2.15.0-dev-develop-<sha>`), matching what the About screen shows.
+
+**Switching is one tap.** Settings → Firmware Slots shows both slots with their
+versions; pick the other one and the device reboots into it. No reflashing, no
+SD card needed.
+
+**Install routing is automatic.** Every update goes to the slot its source
+belongs to, and you are never asked: release-channel firmware (`Latest`) always
+lands in the stable slot; dev-channel and PR builds always land in the dev slot;
+a `.bin` copied to the SD card follows the same rule by its file name. The
+running firmware is never overwritten — if the target slot is the one you are
+running, the device restarts into the other slot, finishes the install from
+there, and reboots. If anything is unsafe (the helper slot is empty or too old
+to finish the job), the install is refused rather than guessing.
+
+**Recovery is built in.** If a dev build ever misbehaves, hold the recovery
+combo (Power + Next) while powering on and the device boots straight into the
+stable slot — no cables, no disassembly. SD-card recovery flashing stays
+available for the rare case where the stable slot itself needs re-flashing.
+
+The dev builds are published as a rolling prerelease on the repo; the stable
+channel stays the official `Latest` release that devices check over signed OTA.
 
 ### 🔜 Coming soon
 

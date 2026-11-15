@@ -25,12 +25,20 @@ enum class SettingAction {
   ClearCache,
   CheckForUpdates,
   SdFirmwareUpdate,
+  FirmwareSlots,
+#if CROSSPOINT_DEV_OTA
+  DevChannel,
+#endif
   Language,
   DownloadFonts,
   TextSettings,
   Plugins,
   KeyboardLayouts,
   HomeButton,
+  ControlsPower,
+  ControlsFront,
+  ControlsSide,
+  ControlsTouch,
   About,
 };
 
@@ -181,10 +189,13 @@ struct SettingInfo {
   }
 };
 
+enum class ControlsGroup : uint8_t { Root, Power, Front, Side, Touch };
+
 // The rows of one SettingsSection; activating a row toggles/cycles it, opens
 // its option popup, or launches its sub-screen.
 class SettingsActivity final : public UiListActivity {
   const SettingsSection section;
+  const ControlsGroup controlsGroup;
   std::vector<SettingInfo> settings;
 
   bool preserveQuickResumeTimeoutOn = false;
@@ -215,7 +226,8 @@ class SettingsActivity final : public UiListActivity {
   void drawFooter() override;
 
  public:
-  SettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, SettingsSection section);
+  SettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, SettingsSection section,
+                   ControlsGroup controlsGroup = ControlsGroup::Root);
   void onEnter() override;
   void render(RenderLock&& lock) override;
 };

@@ -18,12 +18,20 @@
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <Memory.h>
+// The recovery hatch repoints otadata at slot 0 — an ESP32 boot-ROM concept
+// with no simulator counterpart, and the sim env's lib_deps carry no
+// RecoveryBoot include path (platformio.ini [env:simulator]).
+#if !defined(SIMULATOR)
+#include <RecoveryBoot.h>
+#endif
 #include <SPI.h>
 #include <TrustedTime.h>
 #include <WiFi.h>
 #include <XteinkDetect.h>
 #include <builtinFonts/all.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -55,9 +63,12 @@
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/boot_sleep/SleepActivity.h"
+#include "activities/settings/DevOtaActivity.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/DevOtaClient.h"
+#include "network/OtaSlots.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
 #include "util/PluginEvents.h"
@@ -173,6 +184,11 @@ enum class BootResume : uint8_t {
 // device back up against the user's sleep gesture. Never cleared:
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
+// Boot-route classification captured in setup() and consumed by bootFinalize()
+// (top of the first loop pass): a pending dev-install resume must not displace
+// the recovery-firmware picker or the crash-report screen.
+static bool bootRecoveryFirmwareMode = false;
+static bool bootRebootedFromPanic = false;
 
 // Latched true before enterPowerOff() tears down the current activity: WiFi
 // activities call silentRestart() in onExit() to clear heap fragmentation,
@@ -196,6 +212,17 @@ static bool finishWifiSessionWithoutRestart() {
   return true;
 }
 #endif
+
+static unsigned long lastInputTime = 0;
+
+// Screens that block auto-sleep can hold one static image for as long as they
+// run. Once input stops, power the panel down as sleep does; the next paint wakes it.
+static void idleDisplayWhileAwake() {
+  constexpr unsigned long kIdleAfterMs = 30000;
+  if (!activityManager.preventAutoSleep() || millis() - lastInputTime < kIdleAfterMs) return;
+  RenderLock lock(RenderLock::Mode::Try);
+  if (lock.ownsLock()) display.controllerIdle();
+}
 
 // A silent restart is internal maintenance, so the light must come back exactly
 // as the user left it. SETTINGS.frontlightOn is the saved preference and
@@ -372,10 +399,32 @@ bool handleX4ProFrontlightDoubleClick() {
   // Window ownership moved into MappedInputManager (soak-fix7 JFhK): the
   // manager holds the first release out of the served mask until the window
   // resolves, so Sleep/Force-Refresh handlers cannot fire on an ambiguous
-  // click. This consumes only the resolved double-click verdict.
+  // click. This consumes only the resolved double-click verdict. The ACTION
+  // is upstream's doublePwrBtn selector (ported action surface): Frontlight
+  // toggles the light; the other SHORT_PWRBTN actions run their loop-path
+  // equivalents on the double-click (Sleep / ForceRefresh; Footnotes and
+  // PWR_CONFIRM are reader-activity actions with no global equivalent, so
+  // they fall back to Frontlight).
   if (mappedInputManager.consumePowerDoubleClick()) {
-    toggleFrontlight();
-    return true;
+    const uint8_t action = SETTINGS.doublePwrBtn;
+    switch (action) {
+      case CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH:
+        LOG_DBG("MAIN", "Power double-click: manual refresh");
+        if (!activityManager.handleForcedRefresh()) {
+          RenderLock lock;
+          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+        }
+        return true;
+      case CrossPointSettings::SHORT_PWRBTN::SLEEP:
+        LOG_INF("MAIN", "Power double-click: sleep");
+        enterDeepSleep(false);
+        return true;
+      case CrossPointSettings::SHORT_PWRBTN::IGNORE:
+        return true;  // window resolved but the action is disabled: consume it
+      default:
+        toggleFrontlight();
+        return true;
+    }
   }
   return false;
 }
@@ -649,7 +698,9 @@ static void drawSleepChargeStrip(const bool charging, const uint16_t percent) {
   char text[48];
   snprintf(text, sizeof(text), "%s  %u%%", charging ? tr(STR_CHARGING) : tr(STR_CHARGED), percent);
   renderer.drawCenteredText(SMALL_FONT_ID, y + 6, text);
-  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  if (!renderer.displayRetainedGrayscaleOverlay(0, y, renderer.getScreenWidth(), h)) {
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  }
 }
 
 // Shows the charge strip while the power HAL holds sleep on USB power, and
@@ -663,14 +714,16 @@ static bool holdSleepWhileUsbPowered() {
   auto* const sleepFrame = static_cast<uint8_t*>(heap_caps_malloc(frameSize, MALLOC_CAP_SPIRAM));
   if (sleepFrame) memcpy(sleepFrame, renderer.getFrameBuffer(), frameSize);
   const bool buttonPressed = powerManager.holdWhileUsbPowered(gpio, drawSleepChargeStrip);
-  if (sleepFrame) {
-    if (!buttonPressed) {
-      RenderLock lock;
-      memcpy(renderer.getFrameBuffer(), sleepFrame, frameSize);
+  if (!buttonPressed) {
+    RenderLock lock;
+    if (sleepFrame) memcpy(renderer.getFrameBuffer(), sleepFrame, frameSize);
+    const int h = renderer.getLineHeight(SMALL_FONT_ID) + 12;
+    const int y = renderer.getScreenHeight() - h;
+    if (!renderer.displayRetainedGrayscaleOverlay(0, y, renderer.getScreenWidth(), h, true) && sleepFrame) {
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     }
-    heap_caps_free(sleepFrame);
   }
+  heap_caps_free(sleepFrame);
   return buttonPressed;
 }
 #endif
@@ -884,6 +937,16 @@ SET_LOOP_TASK_STACK_SIZE(49152)
 void setup() {
   BoardConfig::holdPowerRails();
 
+  // ADR 2026-11-07 §14: the SDK recovery hatch — hold the board combo
+  // (Power + Next on the X4 Pro, Back + Up on ADC-ladder boards) at reset and
+  // the bootloader is repointed at the stable slot before any subsystem can
+  // interfere. Self-contained: constructs its own InputManager, no-ops unless
+  // the combo is held, slot 0 holds a valid image, and we are not slot 0.
+  // Simulator builds have no bootloader slot table to repoint (see include).
+#if !defined(SIMULATOR)
+  freeink::recovery::checkBootCombo();
+#endif
+
 #ifdef ENABLE_SERIAL_LOG
 #ifdef CROSSPOINT_WAIT_FOR_USB_SERIAL
   // Development builds preserve reliable early CDC logs; release builds let
@@ -922,7 +985,7 @@ void setup() {
   logMemAt("boot");
   // checkPanic() clears the watchdog capture marker after a successful SD
   // dump, so retain the boot classification for the later activity route.
-  const bool rebootedFromPanic = HalSystem::isRebootFromPanic();
+  bootRebootedFromPanic = HalSystem::isRebootFromPanic();
 
   // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
@@ -989,8 +1052,8 @@ void setup() {
   const auto recoveryButton = (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? MappedInputManager::Button::Down
                                                                                      : MappedInputManager::Button::Up;
   // The Picco has no second app slot to flash into (partitions_picco.csv).
-  const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
-                                    !BoardConfig::isPicco() && mappedInputManager.isPressed(recoveryButton);
+  bootRecoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
+                             !BoardConfig::isPicco() && mappedInputManager.isPressed(recoveryButton);
 
   halTiltSensor.begin();
   halClock.begin();
@@ -1032,7 +1095,7 @@ void setup() {
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
 
-  if (recoveryFirmwareMode) {
+  if (bootRecoveryFirmwareMode) {
     LOG_INF("MAIN", "Recovery firmware mode (%s + POWER held at boot)",
             (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? "DOWN" : "UP");
   }
@@ -1206,7 +1269,8 @@ void setup() {
           allowFastInitialReaderRefresh = true;
         }
       } else {
-        // Clean the retained sleep image as part of the first Home paint.
+        // With the fading fix the X3 wake refresh is not promoted to HALF, and
+        // controller RAM is white; clean the retained sleep image on the first Home paint.
         needsWakeRefresh = true;
       }
       break;
@@ -1218,11 +1282,11 @@ void setup() {
   // Output polarity is resolved per render by ActivityManager (night mode
   // inverts only the reading surfaces), so nothing to restore here.
 
-  if (recoveryFirmwareMode) {
+  if (bootRecoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
     activityManager.replaceActivity(
         std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInputManager, /*recoveryMode=*/true));
-  } else if (rebootedFromPanic) {
+  } else if (bootRebootedFromPanic) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
@@ -1294,6 +1358,172 @@ void setup() {
   allowSleepAt = millis() + 2000;
 }
 
+// Design §6: keep OTA-image verification pending past initArduino() so the
+// confirm can happen after a full boot instead. The non-weak definition
+// overrides the Arduino core's weak default (which confirms immediately).
+// The hook lives in a C translation unit (esp32-hal-misc.c), so the override
+// must use C linkage or the weak symbol would simply win.
+extern "C" bool verifyRollbackLater() { return true; }
+
+// Flash-scannable marker (design §5): the dev install path scans the target
+// slot for this string before the dance reboots into it, since
+// esp_app_desc_t.version is an opaque constant from the prebuilt Arduino core
+// (see OtaSlots.h). The resume log below references the array so the linker
+// cannot collect it — the string must stay in the image the scan reads back.
+// A constexpr array cannot be spread into a C array initializer, so the
+// literal is repeated here and pinned to the header constant at compile time.
+constexpr const char kDevOtaResumeHookMarker[] __attribute__((used)) = "XERIF-DEVOTA-RESUME-HOOK-V1";
+
+// Flash-scannable marker (design §16): proves the slot image's boot hook
+// understands the §16 pending kinds (SdDev / StableStaged / StablePicked),
+// not only the §5 DevChannel dance. Referenced in the resume log below so
+// the linker keeps it.
+constexpr const char kDevOtaSwapKindsMarker[] __attribute__((used)) = "XERIF-DEVOTA-SWAP-KINDS-V1";
+
+constexpr bool devOtaMarkerMatchesHeader() {
+  const char* embedded = kDevOtaResumeHookMarker;
+  const char* header = ota_slots::kResumeHookMarker;
+  for (size_t i = 0; i < sizeof(ota_slots::kResumeHookMarker); ++i) {
+    if (embedded[i] != header[i]) return false;
+  }
+  return true;
+}
+static_assert(devOtaMarkerMatchesHeader(), "embedded resume marker must match ota_slots::kResumeHookMarker");
+
+constexpr bool devOtaKindsMarkerMatchesHeader() {
+  const char* embedded = kDevOtaSwapKindsMarker;
+  const char* header = ota_slots::kSwapKindsMarker;
+  for (size_t i = 0; i < sizeof(ota_slots::kSwapKindsMarker); ++i) {
+    if (embedded[i] != header[i]) return false;
+  }
+  return true;
+}
+static_assert(devOtaKindsMarkerMatchesHeader(), "embedded swap kinds marker must match ota_slots::kSwapKindsMarker");
+
+// The resume cannot proceed (record incomplete — no usable binding): owner
+// steer 2026-11-09 — never drop the user on Home without saying why. The
+// FAILED screen on the Dev picker names the refusal; the record stays
+// disarmed (the hook cleared the unusable one before dispatching here).
+static void showResumeRefusal(GfxRenderer& renderer, MappedInputManager& mappedInputManager);
+
+// Runs once at the top of the first loop() pass (see bootFinalized there).
+// Silent boots have already painted their first frame synchronously in
+// setup(); splash boots paint during this first pass. Confirming here
+// reflects "the firmware came all the way up"; a crash before this point
+// (including a setup() panic) rolls back to the other slot.
+static void bootFinalize() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t otaState;
+  if (esp_ota_get_state_partition(running, &otaState) == ESP_OK && otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+    LOG_INF("MAIN", "OTA slot booted; marking valid");
+    esp_ota_mark_app_valid_cancel_rollback();
+  }
+
+  // Pending install (design §5/§16). The dance is the ONE pending-install
+  // mechanism: the running slot stages the asset on SD, records a pending
+  // install, restarts into the OTHER slot (the swap worker), and THIS boot
+  // hook completes the write of the TARGET slot. The pending kind fixes both
+  // the completion slot (the slot OPPOSITE the target — the slot the dance
+  // rebooted into) and the completion activity. A boot into the target slot
+  // itself means the flag is stale (the dance completed, or was armed by a
+  // build that never rebooted); clear it so a boot never re-enters the
+  // installer uninvited.
+  char pendingPayload[dev_ota::kPendingPayloadCap];
+  if (dev_ota::pendingInstallGet(pendingPayload, sizeof(pendingPayload))) {
+    dev_ota::PendingKind kind = dev_ota::PendingKind::DevChannel;
+    if (!dev_ota::pendingInstallGetKind(kind)) {
+      // The kind fixes the target slot and the completion activity; a resume
+      // without it cannot know either. Clearing disarms the unusable record
+      // (a failed DevChannel dispatch would re-fetch the manifest and install
+      // without consent; a failed SD dispatch would guess the slot).
+      // Owner steer 2026-11-09: never drop the user on Home without saying
+      // why — the FAILED screen on the Dev picker names the refusal.
+      LOG_ERR("MAIN", "pending install kind unreadable; clearing, showing the refusal");
+      dev_ota::pendingInstallClear();
+      showResumeRefusal(renderer, mappedInputManager);
+    } else {
+      // The record's completion slot is FIXED by the kind (the dance rebooted
+      // into the worker; the completion pass may only run there).
+      const bool targetIsStable =
+          kind == dev_ota::PendingKind::StableStaged || kind == dev_ota::PendingKind::StablePicked;
+      const esp_partition_t* slot = ota_slots::runningSlot();
+      const esp_partition_t* completionSlot = targetIsStable ? ota_slots::devSlot() : ota_slots::stableSlot();
+      const dev_ota::ResumeRoute route = dev_ota::resumeRoute(kind, ota_slots::sameSlot(slot, completionSlot));
+      if (route == dev_ota::ResumeRoute::Stale) {
+        LOG_INF("MAIN", "stale pending install; clearing");
+        // A StableStaged dance whose otadata switch never landed leaves its
+        // fixed staging file on the swap space. Remove it by the known path —
+        // user-picked files (StablePicked/SdDev) keep their own path and are
+        // never touched here. (DevChannel records in the target slot are NOT
+        // stale: they re-enter the flow below — an interrupted arm must not
+        // strand its consent.)
+        if (kind == dev_ota::PendingKind::StableStaged) {
+          Storage.remove(dev_ota::kStableStagingPath);
+        }
+        dev_ota::pendingInstallClear();
+      } else if (slot != nullptr) {
+        if (bootRecoveryFirmwareMode || bootRebootedFromPanic) {
+          // Recovery picker and crash-report routes outrank the resume; the
+          // flag stays armed so the next clean boot can still finish the
+          // install, and a crash during a retry shows the report instead of
+          // re-entering the installer on every boot.
+          LOG_INF("MAIN", "pending install deferred (recovery=%d panic=%d)", bootRecoveryFirmwareMode ? 1 : 0,
+                  bootRebootedFromPanic ? 1 : 0);
+        } else {
+          LOG_INF("MAIN", "resuming pending install (kind=%d, route=%d, %s, hook %.27s, kinds %.26s)",
+                  static_cast<int>(kind), static_cast<int>(route), pendingPayload, kDevOtaResumeHookMarker,
+                  kDevOtaSwapKindsMarker);
+          if (kind == dev_ota::PendingKind::DevChannel) {
+            // Both routes land here: CompleteFromWorker runs the §5 completion
+            // pass (write the dev slot from the manifest, digest-bound),
+            // ReEnterFromTarget re-runs the dance arm (its otadata switch now
+            // lands — owner report 2026-11-09: the arm skipped it, so the
+            // reboot came back on the dev slot and the boot hook discarded
+            // the record as stale, dropping the user on Home). The consent
+            // gates run either way; every gate that fails disarms the record.
+            auto devOtaActivity = makeUniqueNoThrow<DevOtaActivity>(renderer, mappedInputManager, /*autoResume=*/true);
+            if (devOtaActivity) {
+              activityManager.replaceActivity(std::move(devOtaActivity));
+            } else {
+              // Transient allocation failure (fragmented heap): the flag stays
+              // armed so a later boot can still finish the install — by design,
+              // not a retry loop (no flash is attempted on this path).
+              LOG_ERR("MAIN", "pending install resume: allocation failed");
+            }
+          } else {
+            // SdDev / StableStaged / StablePicked: the §16 SD-file completion
+            // pass writes the TARGET slot (the non-running slot) from the
+            // staged or user-picked SD file. The dispatched kind fixes the
+            // target — the activity must not re-derive it from a second NVS
+            // read whose failure would fall back to DevChannel and skip the
+            // consent digest checks.
+            auto sdFirmwareUpdateActivity =
+                makeUniqueNoThrow<SdFirmwareUpdateActivity>(renderer, mappedInputManager, /*recoveryMode=*/false,
+                                                            /*autoResume=*/true, kind);
+            if (sdFirmwareUpdateActivity) {
+              activityManager.replaceActivity(std::move(sdFirmwareUpdateActivity));
+            } else {
+              LOG_ERR("MAIN", "pending install resume: allocation failed");
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The resume cannot proceed (record incomplete — no usable binding): owner
+// steer 2026-11-09 — never drop the user on Home without saying why. The
+// FAILED screen on the Dev picker names the refusal; the record was
+// disarmed (the hook cleared the unusable one before dispatching here).
+static void showResumeRefusal(GfxRenderer& renderer, MappedInputManager& mappedInputManager) {
+  auto refused = makeUniqueNoThrow<DevOtaActivity>(renderer, mappedInputManager, /*autoResume=*/false);
+  if (refused) {
+    refused->showResumeRefusal();
+    activityManager.replaceActivity(std::move(refused));
+  }
+}
+
 // True when the board can wake the parked GT911 through something other than
 // the touch panel itself: any configured physical button GPIO or ADC ladder
 // (edges + held-contact paths stay live while the controller sleeps). The
@@ -1309,6 +1539,17 @@ static bool hasTouchIndependentWakeSource() {
 }
 
 void loop() {
+  // One-shot boot finalization (design §5/§6), before the first loop pass can
+  // take any early return: (1) confirm the running OTA slot now that setup()
+  // finished — the Arduino core's initArduino() would have confirmed earlier
+  // (before fonts loaded or anything painted), so verification is deferred
+  // here instead; (2) resume a pending dev install recorded by the dance.
+  static bool bootFinalized = false;
+  if (!bootFinalized) {
+    bootFinalized = true;
+    bootFinalize();
+  }
+
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
@@ -1339,6 +1580,7 @@ void loop() {
     // USB Drive handed the raw SD card to the host. Do not run screenshots,
     // sleep, shortcuts, or normal navigation while its filesystem is detached.
     activityManager.loop();
+    idleDisplayWhileAwake();
     if (activityManager.preventAutoSleep()) {
       powerManager.setPowerSaving(false);
       delay(10);
@@ -1362,7 +1604,7 @@ void loop() {
     if (lock.ownsLock()) gaugeCapacityPending = BatteryMonitor::loadDesignCapacity();
   }
 
-  renderer.setFadingFix(SETTINGS.fadingFix);
+  renderer.setFadingFix(SETTINGS.fadingFix && CrossPointSettings::fadingFixSupported());
 
 #if defined(CROSSPOINT_FONT_BACKEND_FT) && CROSSPOINT_FONT_BACKEND_FT && defined(CROSSPOINT_MEM_SENTINEL) && \
     CROSSPOINT_MEM_SENTINEL
@@ -1453,8 +1695,10 @@ void loop() {
   // consumed by the manager's snapshot — after update() that's always
   // nothing, and the inactivity timer would never reset on buttons.
   const bool anyMappedEdge = mappedInputManager.wasAnyPressed() || mappedInputManager.wasAnyReleased();
-  if (anyMappedEdge || gpio.wasTouchActivity() || halTiltSensor.hadActivity() || remoteActed ||
-      activityManager.preventAutoSleep()) {
+  const bool userInput = anyMappedEdge || gpio.wasTouchActivity() || halTiltSensor.hadActivity() || remoteActed;
+  if (userInput) lastInputTime = millis();
+  idleDisplayWhileAwake();
+  if (userInput || activityManager.preventAutoSleep()) {
     lastActivityTime = millis();         // Reset inactivity timer
     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
     // GT911 idle sleep (design 2026-09-24-gt911-idle-sleep.md §3 Tier B): the
@@ -1545,7 +1789,8 @@ void loop() {
 
   // Consume the second X4 Pro power-button release so it does not also run a
   // configured short-power action after toggling the frontlight. The window
-  // itself (arming, expiry → powerConfirmClickFrame) lives in the manager.
+  // itself (arming, expiry → powerConfirmClickFrame) lives in the manager;
+  // the double-click ACTION comes from upstream's doublePwrBtn selector.
   if (handleX4ProFrontlightDoubleClick()) {
     return;
   }

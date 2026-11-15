@@ -20,14 +20,20 @@ class HomeActivity final : public Activity {
   bool firstRenderDone = false;
   bool hasOpdsServers = false;
   bool hasPlugins = false;
-  // The home "library" slot (index 2) shows Plugins when any plugin is
-  // installed, otherwise OPDS. The index converters gate on its presence.
-  bool hasLibrarySlot() const { return hasPlugins || hasOpdsServers; }
+  // The home "library" slot (index 2) shows Plugins while the plugin system is
+  // enabled, otherwise OPDS when a server is configured. NONE hides the slot.
+  // NetworkModeSelectionActivity lists OPDS in exactly the other cases.
+  HomeMenuItem slotItem() const {
+    if (hasPlugins) return HomeMenuItem::PLUGINS;
+    return hasOpdsServers ? HomeMenuItem::OPDS_BROWSER : HomeMenuItem::NONE;
+  }
   bool hasContinueReading = false;
   bool coverRendered = false;      // Track if cover has been rendered once
   bool coverBufferStored = false;  // Track if cover buffer is stored
   uint8_t* coverBuffer = nullptr;  // HomeActivity's own buffer for cover image
   size_t coverBufferSize = 0;      // Bytes allocated to coverBuffer
+  // Output polarity the snapshot was taken in (night mode stores images pre-inverted).
+  bool coverBufferInverted = false;
   // Logical rect last passed to drawRecentBookCover. The cover snapshot only
   // needs to cover this region, not the entire framebuffer, so we cache the
   // tile instead of all 48 KB. Set in render() before the call.
@@ -43,14 +49,18 @@ class HomeActivity final : public Activity {
   const bool cleanInitialRefresh;
 
   // Convert HomeMenuItem to menu index (used in onEnter)
-  static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
+  static int menuItemToIndex(HomeMenuItem item, HomeMenuItem slot) {
     int i = 0;
     if (item == HomeMenuItem::FILE_BROWSER) return i;
     ++i;
     if (item == HomeMenuItem::LIBRARY) return i;
     ++i;
-    if (item == HomeMenuItem::OPDS_BROWSER) return hasOpdsUrl ? i : 0;
-    if (hasOpdsUrl) ++i;
+    if (slot != HomeMenuItem::NONE && item == slot) return i;
+    if (item == HomeMenuItem::PLUGINS) return 0;
+    // OPDS is the slot row only when a server is configured (slot ==
+    // OPDS_BROWSER); otherwise the OPDS item isn't shown at all.
+    if (item == HomeMenuItem::OPDS_BROWSER) return slot == HomeMenuItem::OPDS_BROWSER ? i : 0;
+    if (slot != HomeMenuItem::NONE) ++i;
 #ifdef READING_STATS_ENABLED
     if (item == HomeMenuItem::READING_STATS) return i;
     ++i;
@@ -62,11 +72,11 @@ class HomeActivity final : public Activity {
   }
 
   // Convert menu index to HomeMenuItem (used in loop)
-  static HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) {
+  static HomeMenuItem indexToMenuItem(int idx, HomeMenuItem slot) {
     int i = 0;
     if (idx == i++) return HomeMenuItem::FILE_BROWSER;
     if (idx == i++) return HomeMenuItem::LIBRARY;
-    if (hasOpdsUrl && idx == i++) return HomeMenuItem::OPDS_BROWSER;
+    if (slot != HomeMenuItem::NONE && idx == i++) return slot;
 #ifdef READING_STATS_ENABLED
     if (idx == i++) return HomeMenuItem::READING_STATS;
 #endif

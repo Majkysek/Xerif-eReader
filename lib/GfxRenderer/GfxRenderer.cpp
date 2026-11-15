@@ -223,6 +223,24 @@ void GfxRenderer::begin() {
   // body instead of registered.
 }
 
+bool GfxRenderer::beginWithScratch(uint8_t* buf, const int width, const int height, const int bytesPerRow) {
+  panelWidth = display.getDisplayWidth();
+  panelHeight = display.getDisplayHeight();
+  panelWidthBytes = display.getDisplayWidthBytes();
+  frameBufferSize = display.getBufferSize();
+  if (buf == nullptr || width != panelWidth || height != panelHeight || bytesPerRow != panelWidthBytes ||
+      frameBufferSize != static_cast<uint32_t>(height) * static_cast<uint32_t>(bytesPerRow)) {
+    LOG_ERR("GFX", "Scratch framebuffer geometry mismatch (%dx%d, %d B/row)", width, height, bytesPerRow);
+    // Drop any buffer a previous init left behind: hasFrameBuffer() must not
+    // keep reporting true for a renderer whose init failed (inert state).
+    frameBuffer = nullptr;
+    return false;
+  }
+  frameBuffer = buf;
+  bwBufferChunks.assign((frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE, nullptr);
+  return true;
+}
+
 void GfxRenderer::releaseFrameBufferForBuild() {
   // Lend the framebuffer's bytes IN PLACE: the allocation is never freed, so
   // it cannot move and repeated loans cannot fragment the heap (the previous
@@ -1148,7 +1166,9 @@ void GfxRenderer::drawPixelDither<Color::DarkGray>(const int x, const int y) con
   drawPixel(x, y, (x + y) % 2 == 0);  // TODO: maybe find a better pattern?
 }
 
-void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color) const {
+void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color,
+                                 const DitherMode mode) const {
+  if (mode == DitherMode::PreserveInk && color == Color::White) return;
   switch (color) {
     case Color::Clear:
       break;
@@ -1159,16 +1179,17 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
       fillRectImpl<Color::White>(x, y, width, height);
       break;
     case Color::LightGray:
-      fillRectImpl<Color::LightGray>(x, y, width, height);
+      fillRectImpl<Color::LightGray>(x, y, width, height, mode);
       break;
     case Color::DarkGray:
-      fillRectImpl<Color::DarkGray>(x, y, width, height);
+      fillRectImpl<Color::DarkGray>(x, y, width, height, mode);
       break;
   }
 }
 
 template <Color C>
-void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const int height) const {
+void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const int height,
+                               const DitherMode mode) const {
   if constexpr (C == Color::Clear) return;
   if (width <= 0 || height <= 0) return;
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
@@ -1312,11 +1333,21 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
       const uint8_t blackMask = blackMasks[py & 1];
       const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
 
-      // Dither writes BOTH inks (the slow path called drawPixel for every
-      // pixel — setting or clearing — so we must do the same). Inside the
-      // rect mask: write whiteMask (1s where white, 0s where black). Outside
-      // the rect mask: leave the framebuffer untouched.
       uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
+      switch (mode) {
+        case DitherMode::PreserveInk:
+          for (int byte = byteStart; byte <= byteEnd; ++byte) {
+            uint8_t mask = blackMask;
+            if (byte == byteStart) mask &= headMask;
+            if (byte == byteEnd) mask &= tailMask;
+            row[byte] &= static_cast<uint8_t>(~mask);
+          }
+          continue;
+        case DitherMode::Replace:
+          break;
+      }
+
+      // Replace writes both inks inside the rectangle and leaves other pixels untouched.
       if (byteStart == byteEnd) {
         const uint8_t rectMask = headMask & tailMask;
         row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~rectMask) | (rectMask & whiteMask));
@@ -1332,10 +1363,10 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   }
 }
 
-template void GfxRenderer::fillRectImpl<Color::Black>(int, int, int, int) const;
-template void GfxRenderer::fillRectImpl<Color::White>(int, int, int, int) const;
-template void GfxRenderer::fillRectImpl<Color::LightGray>(int, int, int, int) const;
-template void GfxRenderer::fillRectImpl<Color::DarkGray>(int, int, int, int) const;
+template void GfxRenderer::fillRectImpl<Color::Black>(int, int, int, int, DitherMode) const;
+template void GfxRenderer::fillRectImpl<Color::White>(int, int, int, int, DitherMode) const;
+template void GfxRenderer::fillRectImpl<Color::LightGray>(int, int, int, int, DitherMode) const;
+template void GfxRenderer::fillRectImpl<Color::DarkGray>(int, int, int, int, DitherMode) const;
 
 void GfxRenderer::maskRoundedRectOutsideCorners(const int x, const int y, const int width, const int height,
                                                 const int radius, const Color color) const {
@@ -1995,6 +2026,93 @@ void GfxRenderer::writeFramebufferRegion(int x, int y, int w, int h, const uint8
     uint8_t* dstRow = frameBuffer + (static_cast<uint32_t>(mem.y + row) * panelWidthBytes) + (mem.x / 8);
     memcpy(dstRow, srcRow, rowBytes);
   }
+}
+
+// Flips every pixel of one plane's aligned region, masking the head and tail
+// bytes so the flip stays inside the requested screen rectangle (the aligned
+// walk expands x to byte multiples; a byte-granular XOR would touch up to 7
+// pixels of neighboring content on each edge). Same panel row addressing as
+// readFramebufferRegion so the selection snapshot pair can restore exactly
+// what the flip changed. `rowOffset` shifts the region into band-local
+// scratch addressing (strip targets store rows [_stripY0, _stripY0+_stripRows)
+// with the first band row at byte 0).
+static void invertPlaneRegion(uint8_t* plane, uint16_t panelWidthBytes, const AlignedMemRect& mem,
+                              const AlignedMemRect& exact, const int rowOffset) {
+  const size_t rowBytes = mem.w / 8;
+  // MSB-first packing: pixel mem.x+j sits in bit 7-j. Head byte flips pixels
+  // [exact.x .. byteEnd); the tail byte flips its pixels up to the exact
+  // rect's end; interior bytes flip fully.
+  const int exactEnd = static_cast<int>(exact.x) + exact.w;
+  const uint8_t headMask = mem.x != exact.x ? static_cast<uint8_t>(0xFF >> (exact.x - mem.x)) : 0xFF;
+  const int tailCount = exactEnd - (static_cast<int>(mem.x) + static_cast<int>(mem.w) - 8);
+  const uint8_t tailMask = tailCount < 8 ? static_cast<uint8_t>(0xFF << (8 - tailCount)) : 0xFF;
+  for (uint16_t row = 0; row < mem.h; ++row) {
+    uint8_t* rowPtr =
+        plane + (static_cast<uint32_t>(static_cast<int>(mem.y) + static_cast<int>(row) + rowOffset) * panelWidthBytes) +
+        (mem.x / 8);
+    if (rowBytes > 1) {
+      rowPtr[0] ^= headMask;
+      for (size_t b = 1; b < rowBytes - 1; ++b) rowPtr[b] ^= 0xFF;
+      rowPtr[rowBytes - 1] ^= tailMask;
+    } else {
+      // Single-byte rows: both masks constrain the same byte; a full-width
+      // requirement (mem spans more than 8 px) never collapses to one byte
+      // because the aligned walk only widens when the exact rect is wider.
+      rowPtr[0] ^= headMask & tailMask;
+    }
+  }
+}
+
+void GfxRenderer::invertRegion(const int x, const int y, const int w, const int h) const {
+  if (w <= 0 || h <= 0) return;
+  if (renderMode == GRAYSCALE_LSB || renderMode == GRAYSCALE_MSB) {
+    // The reader's single-plane strip passes forbid external draws (the
+    // walk does not include the BW base or the other plane), and no
+    // selection surface renders inside one.
+    LOG_ERR("GFX", "invertRegion: single-plane strip pass is not invertible");
+    return;
+  }
+
+  // Aligned rect + the exact (unaligned) physical rect the byte masks derive
+  // from: rotate both corners again without the outward x-snap.
+  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
+  if (!mem.valid) return;
+  AlignedMemRect exact = mem;
+  {
+    int ax = 0, ay = 0, bx = 0, by = 0;
+    rotateCoordinates(orientation, x, y, &ax, &ay, panelWidth, panelHeight);
+    rotateCoordinates(orientation, x + w - 1, y + h - 1, &bx, &by, panelWidth, panelHeight);
+    // Lower- and upper-clamped to the panel before the uint16_t casts: a
+    // rotation's arithmetic can produce a negative coordinate for a clipped
+    // edge, and it would wrap into a huge unsigned rect extent.
+    exact.x = static_cast<uint16_t>(std::max(0, std::min(ax, bx)));
+    exact.y = static_cast<uint16_t>(std::max(0, std::min(ay, by)));
+    const int exHi = std::max(ax, bx) + 1;
+    const int eyHi = std::max(ay, by) + 1;
+    exact.w = static_cast<uint16_t>(std::min(exHi, static_cast<int>(panelWidth)) - exact.x);
+    exact.h = static_cast<uint16_t>(std::min(eyHi, static_cast<int>(panelHeight)) - exact.y);
+  }
+
+  // GRAYSCALE_DUAL: when a dual strip target is bound both plane scratches
+  // flip in one move (the 2-bit gray field moves with them); rows clip to the
+  // active band and re-address band-locally (band scratch byte 0 = _stripY0).
+  // Without a bound target the renderer owns no plane storage (planes live in
+  // caller scratch buffers and the panel driver), so only the framebuffer —
+  // the BW base, the same memory the snapshot pair moves — flips.
+  if (renderMode == GRAYSCALE_DUAL && _stripActive && _stripBuf != nullptr && _dualBuf != nullptr) {
+    const int bandTop = std::max(static_cast<int>(exact.y), _stripY0);
+    const int bandBottom = std::min(exact.y + static_cast<int>(exact.h), _stripY0 + _stripRows);
+    if (bandTop >= bandBottom) return;
+    AlignedMemRect band = mem;
+    band.y = static_cast<uint16_t>(bandTop);
+    band.h = static_cast<uint16_t>(bandBottom - bandTop);
+    const int stripOffset = -_stripY0;
+    invertPlaneRegion(_stripBuf, panelWidthBytes, band, exact, stripOffset);
+    invertPlaneRegion(_dualBuf, panelWidthBytes, band, exact, stripOffset);
+    return;
+  }
+  if (frameBuffer == nullptr) return;
+  invertPlaneRegion(frameBuffer, panelWidthBytes, mem, exact, 0);
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
@@ -2765,6 +2883,17 @@ bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDispla
   promotedRefreshPending_ = false;
   absoluteGrayPlanes = mode != HalDisplay::GrayscaleMode::Overlay;
   return true;
+}
+
+bool GfxRenderer::displayRetainedGrayscaleOverlay(int x, int y, int width, int height, bool restore) const {
+  if (x < 0 || y < 0 || width <= 0 || height <= 0 || x >= getScreenWidth() || y >= getScreenHeight() ||
+      width > getScreenWidth() - x || height > getScreenHeight() - y)
+    return false;
+  int ax, ay, bx, by;
+  rotateCoordinates(orientation, x, y, &ax, &ay, panelWidth, panelHeight);
+  rotateCoordinates(orientation, x + width - 1, y + height - 1, &bx, &by, panelWidth, panelHeight);
+  const int x0 = std::min(ax, bx), y0 = std::min(ay, by);
+  return display.displayRetainedGrayscaleOverlay(x0, y0, std::abs(ax - bx) + 1, std::abs(ay - by) + 1, restore);
 }
 
 void GfxRenderer::preconditionGrayscale() const { display.preconditionGrayscale(); }

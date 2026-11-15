@@ -1,6 +1,7 @@
 #pragma once
 #include <ArduinoJson.h>
 #include <BlePageTurner.h>
+#include <BoardConfig.h>
 #include <Epub/ReaderRenderSpec.h>
 #include <Logging.h>
 #include <PersistableStore.h>
@@ -198,6 +199,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     PWR_BOOKMARK = 7,
     PWR_SYNC = 8,
     PWR_READER_MENU = 9,
+    PWR_FRONTLIGHT = 10,
     SHORT_PWRBTN_COUNT
   };
 
@@ -344,6 +346,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // short click sleep; a long press (see POWER_BUTTON_HOLD_MS) always powers
   // the device off, regardless of this setting.
   uint8_t shortPwrBtn = SLEEP;
+  // X4 Pro double click action; Ignore disables the single-click delay.
+  // (action selector ported from upstream's power-button rework; the click
+  // detection itself stays on the fork's PowerClickWindow state machine.)
+  uint8_t doublePwrBtn = PWR_FRONTLIGHT;
   // EPUB reading orientation settings
   // 0 = portrait (default), 1 = landscape clockwise, 2 = inverted, 3 = landscape counter-clockwise
   uint8_t orientation = PORTRAIT;
@@ -407,6 +413,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t uiTheme = LYRA;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
+  // The fading fix compensates the X4/X3 grayscale waveforms; other boards never get it.
+  static bool fadingFixSupported() {
+    const auto board = BoardConfig::ACTIVE.board;
+    return board == BoardConfig::Board::XteinkX4 || board == BoardConfig::Board::XteinkX3 ||
+           board == BoardConfig::Board::XteinkX3Uc8279;
+  }
   // Power button return from footnotes (1 = enabled, 0 = disabled)
   uint8_t pwrBtnFootnoteBack = 1;
   // Use book's embedded CSS styles for EPUB rendering (1 = enabled, 0 = disabled)
@@ -437,6 +449,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t ttfFontPointSize = DEFAULT_TTF_FONT_POINT_SIZE;
   // Dictionary folder name under /dictionaries (empty = no dictionary)
   char dictionaryName[32] = "";
+  // Save successful dictionary lookups to vocabulary history (default off).
+  uint8_t vocabularyHistoryEnabled = 0;
   // Master switch for all SD-card plugin discovery/execution. New installs keep
   // this disabled; settings migration enables it when pre-existing plugin files
   // are found so a firmware update never silently disables an existing setup.
@@ -445,6 +459,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t pluginHubPromptHidden = 0;
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
   uint8_t showHiddenFiles = 0;
+  // Show each file's extension at the end of its row in the file browser (0 = hide, 1 = show)
+  uint8_t showFileExtensions = 1;
   // Show the title and author read from inside each book rather than its
   // filename. Users can disable this to make index rebuilds skip EPUB parsing.
   uint8_t libraryUseMetadata = 1;
@@ -461,6 +477,13 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t finishReadingPrompt = 1;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
+  // TTF-path image decode quality (design 2026-11-07-ttf-image-engine.md §5.6
+  // corrected). 1 = worker/foreground tone caches are baked with
+  // error-diffusion and GIF/BMP decode at all (the new engine). 0 = revert
+  // switch: JPEG/PNG render exactly as before the engine (SDK stack, no
+  // cache) and GIF/BMP stay unrendered. No settings-menu entry yet;
+  // JSON-only (owner adds UI).
+  uint8_t imageDecodeQuality = 1;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
   uint8_t tiltPageTurn = TILT_OFF;
   // Master reader-touch toggle on boards with a touch controller.

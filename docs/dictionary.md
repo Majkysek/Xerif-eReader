@@ -1,6 +1,6 @@
 # Dictionary
 
-Look up words while reading an EPUB using an offline StarDict dictionary stored on the SD card.
+Look up words and phrases while reading an EPUB using an offline StarDict dictionary stored on the SD card.
 
 ## Supported Format
 
@@ -26,27 +26,43 @@ Not supported: dictionaries with 64-bit index offsets (`idxoffsetbits=64` in the
 
 The Dictionary setting only appears when at least one usable dictionary folder exists. Folders containing more than one dictionary (multiple `.idx` stems) are skipped as ambiguous.
 
-## Looking Up a Word
+## Looking Up Words and Phrases
 
 Two ways to start a lookup while reading:
 
 - Open the reader menu (**Confirm**) and choose **Look Up**.
-- Or set **Settings → Controls → Long-press Menu** to "Dictionary", then hold **Confirm** (~0.4s) on the reading page.
+- Or set **Settings → Controls → Front buttons → Menu long press** to "Dictionary", then hold **Confirm** (~0.4s) on the reading page.
 
-One word on the page becomes highlighted:
+### Selecting Text
 
-1. Use **Left/Right** to move between words in reading order, and the side **Up/Down** buttons to jump between lines.
-2. Press **Confirm** to look up the highlighted word.
-3. Press **Back** to return to the reader.
+**On button-driven devices:**
+
+1. A selection cursor appears on a word. Use **Left/Right** to navigate between words in reading order, and the side **Up/Down** buttons to jump between lines or flip across nearby pages.
+2. Press **Confirm** (**Select**) to anchor the start of the selection.
+3. **Single word:** Press **Confirm** again immediately (**Look Up**) to look up the highlighted word.
+4. **Phrase / multiple words:** Use **Left/Right** or **Up/Down** to extend the highlighted selection across words, lines, or pages. Then press **Confirm** (**Look Up**).
+5. Press **Back** at any time to cancel and return to reading.
+
+**On touchscreen devices:**
+
+- Tap or drag the selection handles across words to highlight a word or phrase, then tap **Look Up**.
 
 On the very first lookup with a dictionary (and again whenever the `.idx` or `.syn` source file changes), the reader shows *"Indexing dictionary…"* while it builds small sidecar files next to them — a `.qidx` for the word index, and a `.sidx` when a `.syn` synonym file is present. Each sidecar is rebuilt independently, only when its own source changes. This takes a few seconds for large dictionaries and makes all subsequent lookups fast. The sidecars can be deleted safely at any time — they will simply be rebuilt.
 
 ### How Lookup Works
 
-1. **Direct match** — the word is found as-is (case-insensitive) in the dictionary index. Surrounding punctuation is ignored. An index may list the same headword more than once (one entry per part of speech, for example); every entry it lists is shown, each labelled with its headword.
+1. **Direct match** — the word or phrase is searched case-insensitively in the dictionary index. Leading and trailing punctuation and whitespace are stripped automatically. Hebrew niqqud and cantillation marks are removed from the search term so pointed text can match unpointed headwords. Basic Arabic vowel marks (U+064B–U+0650, U+0652) and superscript alef (U+0670) are also removed; shaddah, hamza, and maddah remain significant. Multi-word phrases match dictionary entries containing spaces (such as idioms, phrasal verbs, or compound terms). An index may list the same headword more than once (one entry per part of speech, for example); every entry it lists is shown, each labelled with its headword.
 2. **Synonyms** — on a miss, if the dictionary ships a `.syn` file, alternate spellings and irregular forms recorded there are resolved to their headword (e.g. `oxen` → `ox`, `colour` → `color`). All the headwords a synonym points at are shown. This step is skipped if the `.sidx` sidecar could not be built (e.g. transient low memory during indexing); the dictionary otherwise stays usable, and the build is retried the next time it is opened.
 3. **Stemming** — still no match: common English word forms are retried automatically: possessives and plurals (`dogs` → `dog`, `stories` → `story`) and verb endings (`walked` → `walk`, `running` → `run`, `making` → `make`).
 4. **Not found** — a short popup appears. Touchscreen devices return to reading; buttons-only devices return to word selection.
+
+## Vocabulary History
+
+Successful lookups started from a book page are appended to `/Vocabulary.txt` at the root of the SD card. This is separate from `My Clippings.txt`; looking up a word does not create a highlight. Failed lookups are not recorded, and an SD-card write failure does not interrupt the dictionary.
+
+The file uses UTF-8 **JSON Lines**: one JSON object per line, versioned with `"v":1`. Each record has a random `id`, `word` (selected text), `headword` (dictionary match), `definition` (plain text), and `timestamp` (Unix seconds, or `null` when the clock is unavailable). It also includes `title`, `author`, `series`, `series_index`, `chapter`, `page` (1-based chapter page), `spine` (0-based EPUB spine index), and `start_offset` (EPUB source offset, or `null` when unavailable). Missing series information is represented by an empty name and a `null` index. Definitions are limited to 2 KiB, looked-up words and matched headwords to 160 UTF-8 bytes each, and book fields to bounded lengths. The `definition_truncated` boolean indicates whether the definition (but not the word or headword) was shortened; when possible the saved definition ends at a complete line. HTML dictionary definitions are converted to plain text.
+
+Repeated lookups are recorded separately. Positions reflect the reader layout at lookup time and may change when the book is reflowed. The `chapter` title is resolved from the selected word's rendered page, not its exact offset: if two TOC chapter boundaries share a page, the title may refer to the later chapter rather than the one containing the word. Lookups made from inside a dictionary definition are not currently included.
 
 ## The Definition Screen
 

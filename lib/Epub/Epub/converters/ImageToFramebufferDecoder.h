@@ -7,6 +7,8 @@
 #include <memory>
 #include <string>
 
+#include "Epub/converters/DitherUtils.h"
+
 class GfxRenderer;
 
 // Read-only, seekable view over a memory buffer (PSRAM pool buffer on PSRAM
@@ -75,6 +77,39 @@ struct RenderConfig {
   float sourceCropY = 0.0f;         // Fraction cropped equally from the top and bottom edges
   bool preserveAlpha = false;       // Skip transparent pixels instead of compositing them against white
   std::string cachePath;            // If non-empty, decoder will write pixel cache to this path
+  // Cooperative abort for the background image predecode worker (§5.7 rule
+  // 2). Checked at each converter's band boundary; when it returns true the
+  // decode stops and fails, and the partial pixel cache is dropped by the
+  // converter's existing failure path. Foreground paths leave both null — no
+  // behavior change.
+  bool (*abortPoll)(void* ctx) = nullptr;
+  void* abortCtx = nullptr;
+  // Quality tone bake (TTF image engine §5.6): GIF switches from Bayer
+  // 4-level + nearest to area-averaged downscale (≥2x) + Floyd–Steinberg
+  // 4-level tone. The BITMAP engine never sets this — zero behavior change
+  // there; the flag only turns on inside the TTF image decode paths.
+  bool qualityTone = false;
+  // The bake the quality path quantizes through (design 2026-11-08 §5.2).
+  // Null with qualityTone set: the converter falls back to nearest + Bayer
+  // (the legacy dither) — no per-converter error-diffusion bake exists.
+  // The TTF quality path injects ttfimg::ToneBake4; the revert switch
+  // (qualityTone false) never reaches the converters (decodeAndCache Skip).
+  ToneBaker* toneBake = nullptr;  // Adaptive two-phase collection (design 2026-11-08 §2.1 amendment 2):
+  // with toneCollect the converter only FEEDS the bake's collection pass
+  // (histogram + gray temp) — no paint, no pixel cache (cachePath stays
+  // empty); the engine's remap pass owns tone, cache and paint.
+  bool toneCollect = false;
+  // DPID pass-through (design 2026-11-09-ttf-image-dpid-clahe.md): with
+  // qualityTone + toneCollect, the converter hands the RAW source rows to
+  // the app-side DpidScaler instead of running its own box resize (one
+  // resize implementation for every decoder). sourceDimsFn fires ONCE with
+  // the canvas dims before the first row (the app allocates its scratch
+  // there); sourceRowFn fires per completed source row in raster order.
+  // Returning false from either aborts the decode (the engine's legacy
+  // fallback paints). Both null = the converter's in-loop resize, unchanged.
+  bool (*sourceDimsFn)(void* user, int srcW, int srcH) = nullptr;
+  bool (*sourceRowFn)(void* user, int srcY, const uint8_t* gray) = nullptr;
+  void* sourceUser = nullptr;
 };
 
 class ImageToFramebufferDecoder {

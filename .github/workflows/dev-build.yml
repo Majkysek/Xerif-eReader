@@ -1,0 +1,210 @@
+# Dev firmware channel (design docs/design/2026-11-07-dev-ota-slots.md §4/§13).
+#
+# No build happens here (§13): ci.yml already built the x4pro image for the
+# triggering develop commit and uploaded it as the `firmware-x4pro.bin`
+# artifact (7-day retention). This lane consumes that artifact — the
+# pr-firmware-links.yml pattern: CI builds once, publish lanes are thin
+# consumers — and republishes the rolling `dev` prerelease: the newest
+# 3 `xerif-dev-<sha>-x4pro.bin` assets plus a regenerated manifest.json
+# (name/url/sha256/date, newest first). The device fetches this release,
+# parses the manifest, and installs a build into the dev slot (app1) after
+# verifying the SHA-256 (unsigned manifest, SHA-pinned only).
+#
+# The checkout is pinned to `github.event.workflow_run.head_sha` so the stamp
+# and the manifest date derive from the triggering commit, not the current
+# default-branch HEAD. The stamp (`--version`) and the `--validate` publish
+# gate run on the downloaded artifact BEFORE the manifest step hashes it, so
+# the manifest hash matches the published, stamped asset.
+#
+# Note on patching: the design doc names a `patch_firmware_image.py` step;
+# `scripts/patch_dev_version.py` implements it for the dev channel only — the
+# staging step below rewrites the image's esp_app_desc_t version (a constant
+# baked into the prebuilt Arduino core) with the dev-version string from
+# scripts/git_branch.py --print-dev-version (the single derivation site),
+# recomputing the image's appended SHA-256 digest, so the slot chooser can
+# tell dev builds apart and the stamped image still passes install/boot
+# verification (design §12). Release builds are stamped with their plain
+# tag version (release.yml); PR firmware is stamped by pr-firmware-links.yml
+# with the --branch head-branch override.
+
+name: Dev build
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+concurrency:
+  # Repo-wide publication lane shared with the PR publish lane
+  # (pr-firmware-links.yml) and the PR delete lane (pr-dev-cleanup.yml);
+  # design docs/design/2026-11-08-dev-ota-pr-firmware.md (D6). Publishers wait
+  # on each other; the delete lane (cancel-in-progress: true) is what may
+  # cancel an in-progress publication — an interrupted publication is the one
+  # state that can degrade the rolling release. Publication itself stays
+  # develop-only via the job's `if`.
+  group: dev-release-manifest
+  cancel-in-progress: false
+
+permissions:
+  actions: read   # downloads the CI run's `firmware-x4pro.bin` artifact
+  contents: write # republishes the rolling `dev` prerelease
+
+jobs:
+  build-and-publish:
+    name: Publish dev channel from the CI artifact
+    # The D6 develop-only publication lane: a CI run on any other branch, or a
+    # failed CI run, is a no-op — a dev build is only published from a
+    # CI-green develop commit (design docs/design/2026-11-07-dev-ota-slots.md
+    # §13).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Download the x4pro firmware artifact from the CI run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh run download "${{ github.event.workflow_run.id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name firmware-x4pro.bin \
+            --dir artifact
+          then
+            echo "CI artifact 'firmware-x4pro.bin' not found for run" \
+              "${{ github.event.workflow_run.id }}" \
+              "(retention expired or the CI matrix no longer uploads it); aborting" >&2
+            exit 1
+          fi
+
+      - name: Stage dev asset + carry over previous builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEV_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist carry
+          asset="xerif-dev-${DEV_SHA}-x4pro.bin"
+          mv artifact/firmware.bin "dist/${asset}"
+
+          # Stamp the dev version into the image's esp_app_desc_t (design
+          # docs/design/2026-11-07-dev-ota-slots.md §12): the prebuilt Arduino
+          # core bakes a constant version into every image, so the slot
+          # chooser could not tell dev builds apart. The stamp lands on the
+          # dist copy BEFORE the manifest step computes the asset's sha256, so
+          # the manifest hash matches the published, stamped asset.
+          # git_branch.py --print-dev-version is the single source of the
+          # dev-version string (the same derivation the build middleware
+          # compiles into CROSSPOINT_VERSION); patch_dev_version.py only
+          # enforces the fit and recomputes the appended digest.
+          # --branch is mandatory here: this checkout pins workflow_run
+          # head_sha, so the checkout itself has no branch and the derivation
+          # would refuse rather than stamp a detached/unknown identity.
+          base_version="$(python3 scripts/git_branch.py --print-dev-version --branch "${DEV_BRANCH}")"
+          python3 scripts/patch_dev_version.py \
+            --image "dist/${asset}" \
+            --version "${base_version}"
+          python3 scripts/patch_dev_version.py --image "dist/${asset}" --verify
+          # Regression gate: the stamped asset must pass the FULL verifier
+          # (XOR checksum byte + appended digest) before it may reach the
+          # release — a bad image here aborts the run instead of shipping
+          # something the device rejects as invalid.
+          python3 scripts/patch_dev_version.py --image "dist/${asset}" --validate
+
+          # Carry over the previous builds from the current `dev` release. The
+          # existing manifest is the authoritative newest-first list — its top
+          # 2 entries survive this run so the rolling window stays at 3.
+          # Distinguish "first publish" from "read failure": a release that
+          # cannot be read is an abort (the publish step would otherwise drop
+          # its retained builds); only a confirmed-missing release starts fresh.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/dev" > release.json 2> view_err.txt; then
+            gh release download dev --repo "$GITHUB_REPOSITORY" --dir carry
+            echo "downloaded previous dev release assets"
+          elif grep -qiE 'HTTP 404|not found' view_err.txt; then
+            echo "no existing dev release; starting fresh"
+            rm -f release.json
+          else
+            echo "existing dev release could not be read; aborting without publishing" >&2
+            cat view_err.txt >&2
+            exit 1
+          fi
+
+      - name: Regenerate manifest.json (newest 3 dev + newest 6 PR entries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # Shared generator (.github/workflows/generate_dev_manifest.py): the
+          # manifest now also lists PR firmware published to this release by
+          # pr-firmware-links.yml. The keep = 3 cap applies to develop builds
+          # only; PR entries (`xerif-pr-*`) are retained up to the N=6 window
+          # (design docs/design/2026-11-08-dev-ota-pr-firmware.md §4.3).
+          python3 .github/workflows/generate_dev_manifest.py \
+            --out dist/manifest.json \
+            --prior carry/manifest.json \
+            --new-bin "dist/xerif-dev-${DEV_SHA}-x4pro.bin" \
+            --new-date "$(git show -s --format=%cI "${DEV_SHA}")" \
+            --local dist carry
+
+      - name: Publish the dev release (in place, no delete window)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # In-place publication: the rolling release is never deleted, so a
+          # failed or cancelled run cannot wipe the channel — the previous
+          # manifest and bins stay live until this upload replaces them.
+          # Retained builds keep their existing assets on the surviving
+          # release (the manifest references them by URL); --clobber only
+          # replaces names this run owns (its own bin + manifest.json).
+          if ! gh release view dev --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create dev \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Dev builds (rolling)" \
+              --notes "Rolling dev channel: the newest 3 x4pro builds from develop. Install from Settings > Dev channel on a dev build; unsigned manifest, SHA-256 pinned."
+          fi
+          gh release upload dev --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/xerif-dev-*.bin dist/manifest.json
+
+      - name: Prune assets outside the manifest window
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Runs AFTER the manifest upload: an interrupted run can only leave
+          # extra assets (harmless — the manifest defines the truth), never a
+          # missing one. The keep-set covers PR firmware too: a `xerif-pr-*`
+          # asset that fell out of the manifest's N=6 window (or whose PR
+          # close-deletion raced a publish) is pruned here on the next develop
+          # publish.
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          keep = {v["name"] for v in json.load(open("dist/manifest.json"))["versions"]}
+          keep.add("manifest.json")
+          rel = json.loads(subprocess.run(
+              ["gh", "api", f"repos/{repo}/releases/tags/dev"],
+              check=True, capture_output=True, text=True).stdout)
+          for a in rel.get("assets", []):
+              if a["name"] not in keep:
+                  subprocess.run(["gh", "api", "-X", "DELETE",
+                                  f"repos/{repo}/releases/assets/{a['id']}"], check=True)
+                  print("pruned", a["name"])
+          PY

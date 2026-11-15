@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <string_view>
 
+#include "DevOtaClient.h"
 #include "OtaJson.h"
 
 namespace {
@@ -558,4 +560,141 @@ TEST(OtaVersionCompare, MalformedTagsFailClosed) {
   EXPECT_FALSE(otaIsVersionNewer("1.9.0-x4pro", "not-a-version"));
   EXPECT_FALSE(otaIsVersionNewer("", "v1.9.0"));
   EXPECT_FALSE(otaIsVersionNewer("1.9.0-x4pro", ""));
+}
+
+// --- dev channel manifest (design §4) ---------------------------------------
+
+namespace {
+constexpr char kDevManifest[] = R"({
+  "versions": [
+    {"name": "xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin",
+     "url": "https://github.com/Belphemur/Xerif-eReader/releases/download/dev/xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin",
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "date": "2026-11-07T12:00:00Z"},
+    {"name": "xerif-dev-ffffffffffffffffffffffffffffffffffffffff-x4pro.bin",
+     "url": "https://github.com/Belphemur/Xerif-eReader/releases/download/dev/xerif-dev-ffffffffffffffffffffffffffffffffffffffff-x4pro.bin",
+     "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+     "date": "2026-11-06T12:00:00Z"}
+  ]
+})";
+}  // namespace
+
+TEST(OtaDevManifestParse, ParsesEntriesNewestFirst) {
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kDevManifest, strlen(kDevManifest), entries, 3, &count));
+  ASSERT_EQ(count, 2);
+  EXPECT_STREQ(entries[0].name, "xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin");
+  EXPECT_EQ(entries[0].url, std::string_view("https://github.com/Belphemur/Xerif-eReader/releases/download/dev/"
+                                             "xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin"));
+  EXPECT_STREQ(entries[0].date, "2026-11-07T12:00:00Z");
+  EXPECT_TRUE(entries[0].hasSha);
+  // First digest byte decodes from "e3" (e3b0c4... is sha256 of "").
+  EXPECT_EQ(entries[0].sha256[0], 0xE3);
+  EXPECT_EQ(entries[0].sha256[31], 0x55);
+}
+
+TEST(OtaDevManifestParse, MalformedHexDigestSetsHasShaFalse) {
+  constexpr char kBadSha[] =
+      R"({"versions": [{"name": "a.bin", "url": "https://x/a.bin", "sha256": "nothex", "date": "d"}]})";
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kBadSha, strlen(kBadSha), entries, 3, &count));
+  ASSERT_EQ(count, 1);
+  EXPECT_FALSE(entries[0].hasSha);
+}
+
+TEST(OtaDevManifestParse, OverflowTruncatesToCapacity) {
+  OtaDevVersionEntry entries[1];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kDevManifest, strlen(kDevManifest), entries, 1, &count));
+  EXPECT_EQ(count, 1);
+  EXPECT_STREQ(entries[0].name, "xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin");
+}
+
+TEST(OtaDevManifestParse, MalformedJsonFailsClosed) {
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  EXPECT_FALSE(parseOtaDevManifest("not json", 8, entries, 3, &count));
+  EXPECT_EQ(count, 0);
+  EXPECT_FALSE(parseOtaDevManifest(nullptr, 0, entries, 3, &count));
+  EXPECT_FALSE(parseOtaDevManifest("{}", 2, entries, 3, nullptr));
+}
+
+TEST(OtaDevManifestParse, MissingFieldsLeaveEmptyStrings) {
+  constexpr char kSparse[] = R"({"versions": [{"name": "a.bin"}]})";
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kSparse, strlen(kSparse), entries, 3, &count));
+  ASSERT_EQ(count, 1);
+  EXPECT_STREQ(entries[0].name, "a.bin");
+  EXPECT_EQ(entries[0].url[0], '\0');
+  EXPECT_EQ(entries[0].date[0], '\0');
+  EXPECT_FALSE(entries[0].hasSha);
+}
+
+TEST(OtaDevManifestParse, VersionFieldParsedWhenPresent) {
+  constexpr char kVersioned[] =
+      R"({"versions": [{"name": "xerif-dev-0123456789abcdef0123456789abcdef01234567-x4pro.bin", "url": "https://x/a.bin", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "date": "2026-11-07T12:00:00Z", "version": "2.14.0-dev-develop-32c5038a4"}]})";
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kVersioned, strlen(kVersioned), entries, 3, &count));
+  ASSERT_EQ(count, 1);
+  EXPECT_STREQ(entries[0].version, "2.14.0-dev-develop-32c5038a4");
+}
+
+TEST(OtaDevManifestParse, AbsentVersionFieldLeavesEmptyForNameFallback) {
+  // kDevManifest carries no version field (older-manifest shape): the device
+  // falls back to the asset name for such rows.
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kDevManifest, strlen(kDevManifest), entries, 3, &count));
+  ASSERT_EQ(count, 2);
+  EXPECT_EQ(entries[0].version[0], '\0');
+  EXPECT_EQ(entries[1].version[0], '\0');
+}
+
+TEST(OtaDevManifestParse, OverlongVersionClampsToFieldCapacity) {
+  std::string json = R"({"versions": [{"name": "a.bin", "url": "https://x/a.bin", "version": ")";
+  json += std::string(60, 'a');  // over version[48]
+  json += R"("}]})";
+  OtaDevVersionEntry entries[3];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(json.c_str(), json.size(), entries, 3, &count));
+  ASSERT_EQ(count, 1);
+  EXPECT_EQ(strlen(entries[0].version), sizeof(entries[0].version) - 1);
+  for (size_t i = 0; i < sizeof(entries[0].version) - 1; ++i) {
+    EXPECT_EQ(entries[0].version[i], 'a');
+  }
+}
+
+TEST(OtaDevManifestParse, FullWindowDevAndPrEntriesParse) {
+  // CI's rolling window is 3 dev builds + up to 6 PR entries (design §4). The
+  // device cap must hold the whole window — a picker showing only the dev
+  // rows hides installable PR builds (owner report: "only 3 choices").
+  constexpr char kFive[] = R"({"versions":[
+    {"name":"xerif-dev-aaaa-x4pro.bin","url":"https://e/1.bin","date":"2026-11-08","version":"2.14.0-dev-develop-aaaa","sha256":"1111111111111111111111111111111111111111111111111111111111111111"},
+    {"name":"xerif-dev-bbbb-x4pro.bin","url":"https://e/2.bin","date":"2026-11-08","version":"2.14.0-dev-develop-bbbb","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},
+    {"name":"xerif-dev-cccc-x4pro.bin","url":"https://e/3.bin","date":"2026-11-08","version":"2.14.0-dev-develop-cccc","sha256":"3333333333333333333333333333333333333333333333333333333333333333"},
+    {"name":"xerif-pr-305-dddd-x4pro.bin","url":"https://e/4.bin","date":"2026-11-08"},
+    {"name":"xerif-pr-305-eeee-x4pro.bin","url":"https://e/5.bin","date":"2026-11-08"}
+  ]})";
+  OtaDevVersionEntry entries[dev_ota::kMaxVersions];
+  int count = -1;
+
+  ASSERT_TRUE(parseOtaDevManifest(kFive, strlen(kFive), entries, dev_ota::kMaxVersions, &count));
+  EXPECT_EQ(count, 5);
+  EXPECT_STREQ(entries[3].name, "xerif-pr-305-dddd-x4pro.bin");
+  EXPECT_STREQ(entries[4].name, "xerif-pr-305-eeee-x4pro.bin");
+  // PR entries carried without a stamped version leave the field empty — the
+  // device UI falls back to the asset name for them.
+  EXPECT_EQ(entries[4].version[0], '\0');
 }

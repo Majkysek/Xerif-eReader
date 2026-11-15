@@ -22,8 +22,10 @@
 #include "ReaderToolbarUi.h"
 #include "TouchLongPressMode.h"
 #include "components/OptionPopup.h"
+#include "vocabulary/VocabularyStore.h"
 #if defined(CROSSPOINT_TTF_READER)
 #include "FibpPrefetchWorker.h"
+#include "ImagePredecodeWorker.h"
 #include "QuickPageCapture.h"
 #include "TtfBookRuntime.h"
 #include "TtfResolvePolicy.h"
@@ -42,6 +44,7 @@ struct TouchPageTurn;
 
 class EpubReaderActivity final : public ReaderActivity {
   std::shared_ptr<Epub> epub;
+  std::unique_ptr<Epub::SyncMetadata> vocabularyMetadata;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
@@ -240,6 +243,23 @@ class EpubReaderActivity final : public ReaderActivity {
   BookReadingStats achievementStatsPreview(uint32_t* pendingReadingSeconds = nullptr) const;
 #endif
 
+  // Oriented content margins in screen pixels (oriented viewable TRBL +
+  // screen margin + status-bar/auto-turn bottom rule) — the box both render
+  // engines paint into.
+  struct ContentMargins {
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    int left = 0;
+  };
+  // The content viewport the CURRENT render was built for. Each render path
+  // calls it on its layout pass (renderBook() legacy, renderBookTtf() TTF);
+  // clip anchoring and the render-spec signature read the members. One
+  // arithmetic block for both engines so they cannot drift apart. Returns the
+  // margins it used (legacy render paints through them; TTF lays out from
+  // makeLayoutParams).
+  ContentMargins assignBuildViewport();
+
   uint16_t buildViewportWidth = 0;
   uint16_t buildViewportHeight = 0;
   bool partialRebuildStartFailed = false;
@@ -259,6 +279,32 @@ class EpubReaderActivity final : public ReaderActivity {
   // (FibpPrefetchWorker.h, kody-rr9).
   freeink::book::FibpWorkerPtr fibpWorker_;
   bool fibpBegun_ = false;
+  // TTF-path image predecode (design 2026-11-07-ttf-image-engine.md): one
+  // worker per reader session, armed only on TTF/PSRAM boards; jobs are
+  // sighted from the .fibp page-cache image records. Anchored to the same
+  // teardown sites as the FIBP worker (stopImagePredecode mirrors
+  // stopFibpWorker). Inert on non-PSRAM builds (stub).
+  ImagePredecodeWorkerPtr imagePredecode_;
+  bool imagePredecodeBegun_ = false;
+  // Sighting bookkeeping: one pass per (spine, generation); the worker's
+  // enqueue dedupe makes re-sight cheap. The cursor spreads the full-spine
+  // walk over paints (kSightPagesPerPaint page records per pass) so the
+  // loop task never pays hundreds of SD blob reads in one paint.
+  static constexpr uint16_t kSightPagesPerPaint = 12;
+  uint16_t ttfImagesSightedSpine_ = 0xFFFF;
+  uint32_t ttfImagesSightedGen_ = 0;
+  // Current-spine pages sighted when the walk last completed: a later
+  // same-generation cache extension (FIBP worker commits) re-arms the walk
+  // from here instead of re-scanning the chapter.
+  uint16_t ttfSightedPageCount_ = 0;
+  uint16_t ttfSightCursorSpine_ = 0xFFFF;
+  uint32_t ttfSightCursorGen_ = 0;
+  uint16_t ttfSightCursorPage_ = 0;
+  bool ttfSightCursorNext_ = false;
+  // Wedged image-worker join (stopImagePredecode): the worker object was
+  // released alive and still dereferences the book surfaces raw — the
+  // destructor must keep ttf_/epub alive with it (leak beats UAF).
+  bool imagePredecodeLeaked_ = false;
   char fibpFamily_[48] = {};  // family the worker's faces were built for
   uint32_t fibpNotifiedGen_ = 0;
   bool fibpDeferred_ = false;           // a build is delegated to the worker
@@ -325,6 +371,14 @@ class EpubReaderActivity final : public ReaderActivity {
                            size_t scratchMark);
   void renderTtfGrayFullFrame(const freeink::book::Page& page, const freeink::book::LayoutParams& params,
                               size_t scratchMark);
+  // Image pages on absolute-capable panels (design 2026-11-08 §5.1): the
+  // legacy reader's absolute arm over the TTF paint — base display, then a
+  // two-pass plane walk of the page content, no DUAL targets (the engine's
+  // FrameTarget can only write the framebuffer; the framebuffer IS each
+  // pass's plane source). Falls back to the B/W display when the driver or
+  // the BW buffer refuses.
+  void renderTtfImageGrayAbsolute(const freeink::book::Page& page, const freeink::book::LayoutParams& params,
+                                  size_t scratchMark);
   // Rasterizes an engine page through the active render mode (gray parity or
   // 1bpp): text + rubies + rules + images/placeholder. Shared by the reader's
   // own page render and the TTF dictionary selector's repaint hook.
@@ -345,6 +399,18 @@ class EpubReaderActivity final : public ReaderActivity {
   // worker builds the entered chapter, the sync path defers to its commit.
   void updateFibpWorker(uint32_t generation, const freeink::book::LayoutParams& params);
   void stopFibpWorker();
+  // Image-predecode wiring (lifetime mirrors stopFibpWorker's sites).
+  void stopImagePredecode();
+  // Sight image records from a spine's .fibp page cache into the worker
+  // (§5.2): pages [firstPage, endPageExclusive) in reading order.
+  // Returns the pages actually sighted (reads that completed); a caller
+  // advancing a cursor must use the return value so a failed read is
+  // retried, not skipped.
+  uint16_t sightTtfSpineImages(uint16_t spineIndex, uint16_t firstPage, uint16_t endPageExclusive);
+  // One bounded sighting walk (§5.2); true when both spines are fully
+  // sighted for the current generation. Runs from the paint path and the
+  // idle build tick so fast-turn runs keep predecode moving.
+  bool ttfSightingPass();
   void ttfInvalidateCaches();
   void ttfShowIndexingPopup();
   void ttfSaveProgress();
@@ -525,6 +591,15 @@ class EpubReaderActivity final : public ReaderActivity {
   // SETTINGS.touchLongPressAction global.
   void openDictionaryWordSelect(int touchX = -1, int touchY = -1,
                                 TouchLongPressMode mode = TouchLongPressMode::Dictionary);
+  // Lazily loads the book's sync metadata (series info) once per book, only
+  // when vocabulary history is enabled. Shared by both word-select paths.
+  void ensureVocabularyMetadata();
+#if defined(CROSSPOINT_TTF_READER)
+  // Book context for vocabulary history on the TTF path. The start character
+  // offset is left unknown (UINT32_MAX): TtfWordSelect boxes carry per-page
+  // token offsets, not a chapter-absolute selection anchor.
+  VocabularyContext ttfVocabularyContext(uint16_t ttfPage);
+#endif
   // Selection to restore when returning from a dictionary lookup.
   ClipSelectionActivity::Selection pendingLookupSelection;
   ClipSelectionActivity::Selection lookupReturnSelection;

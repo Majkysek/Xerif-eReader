@@ -312,6 +312,20 @@ EpubReaderActivity::~EpubReaderActivity() {
 #endif
   // ActivityManager destroys activities with its RenderLock already held;
   // taking another here self-deadlocks (renderingMutex is non-recursive).
+  // Belt-and-braces against a teardown path that skipped onExit(): the
+  // worker dereferences epub_/source_ raw, so it must die before ttf_/epub
+  // go. No-op when onExit already stopped it.
+#if defined(CROSSPOINT_TTF_READER)
+  stopImagePredecode();
+  if (imagePredecodeLeaked_) {
+    // A wedged image worker was released alive and still dereferences the
+    // book surfaces raw (leak-beats-UAF, the stopFibpWorker contract): keep
+    // the TTF runtime and the EPUB allocation alive with it. One-off,
+    // wedged-join only; the resets below become no-ops.
+    (void)ttf_.release();
+    (void)new std::shared_ptr<Epub>(epub);  // intentional leak: keeps epub alive
+  }
+#endif
   settleOverlayRefresh();
   discardOverlayPage();  // free the overlay's page snapshot if one is held
   // A radio still stopped for this book's build may start again in the next one.
@@ -384,6 +398,7 @@ void EpubReaderActivity::onExit() {
 #if defined(CROSSPOINT_TTF_READER)
   // R1: transient worker lifetime — cancel + join + free before teardown.
   stopFibpWorker();
+  stopImagePredecode();
 #endif
 #ifdef READING_STATS_ENABLED
   if (epub && SETTINGS.shouldTrackReadingStats()) {
@@ -856,6 +871,16 @@ bool EpubReaderActivity::loadBook() {
     }
   }
   if (fibpWorker_ != nullptr) fibpWorker_->reserveStack();
+  // Image-predecode reserve: same reader-entry window as the FIBP stack (the
+  // queue ring is DRAM, the scratch + decode arena PSRAM) — the EPUB open's
+  // ZIP index cache is the DRAM pressure that must not land first (§6).
+  if (imagePredecode_ == nullptr && SETTINGS.readerFontEngine == CrossPointSettings::READER_ENGINE_TTF) {
+    imagePredecode_.reset(makeImagePredecodeWorkerInternal());  // internal-DRAM-capped TCB (kody-rr9)
+    if (imagePredecode_ == nullptr) {
+      LOG_ERR("ERS", "Image predecode object alloc failed — predecode disabled");
+    }
+  }
+  if (imagePredecode_ != nullptr) imagePredecode_->reserve();
 #endif
 
   auto loadedEpub = makeUniqueNoThrow<Epub>(bookPath, "/.crosspoint");
@@ -899,6 +924,7 @@ bool EpubReaderActivity::loadBook() {
     return false;
   }
   epub = std::move(loadedEpub);
+  vocabularyMetadata.reset();
 
   ImageBlock::clearRenderFailures();
   ImageBlock::setExtractor(epub.get(), [](void* ctx, const char* src, const char* dest) {
@@ -929,6 +955,11 @@ bool EpubReaderActivity::loadBook() {
       // Sync the FT faces' render mode before the first render/worker session
       // (onEnter ran before ttf_ existed on a fresh open).
       freeink::book::fontLoader.applyRenderMode(SETTINGS.textRenderMode == CrossPointSettings::TEXT_RENDER_CRISP);
+      ttf_->setDecodeEpub(epub.get());  // GIF/BMP decode extractions (§5.4)
+      if (imagePredecode_ != nullptr && !imagePredecode_->begun()) {
+        imagePredecodeBegun_ = imagePredecode_->begin(epub.get(), &ttf_->source(), &ttf_->catalog().zip(),
+                                                      ttfCacheDir.c_str(), ttfGeneration);
+      }
     }
   }
 #endif
@@ -1263,6 +1294,33 @@ void EpubReaderActivity::backgroundBuildTick() {
   }
 }
 
+void EpubReaderActivity::ensureVocabularyMetadata() {
+  if (!SETTINGS.vocabularyHistoryEnabled || vocabularyMetadata || !epub) return;
+  auto metadata = makeUniqueNoThrow<Epub::SyncMetadata>();
+  if (metadata && epub->loadSyncMetadata(*metadata)) {
+    vocabularyMetadata = std::move(metadata);
+  }
+}
+
+#if defined(CROSSPOINT_TTF_READER)
+VocabularyContext EpubReaderActivity::ttfVocabularyContext(uint16_t ttfPage) {
+  VocabularyContext vocabulary;
+  if (!epub) return vocabulary;
+  vocabulary.title = epub->getTitle();
+  vocabulary.author = epub->getAuthor();
+  const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  if (tocIndex >= 0) vocabulary.chapter = epub->getTocItem(tocIndex).title;
+  ensureVocabularyMetadata();
+  if (vocabularyMetadata) {
+    vocabulary.series = vocabularyMetadata->series;
+    vocabulary.seriesIndex = vocabularyMetadata->seriesIndex;
+  }
+  vocabulary.page = static_cast<uint16_t>(ttfPage + 1);
+  vocabulary.spine = static_cast<uint16_t>(currentSpineIndex);
+  return vocabulary;
+}
+#endif
+
 void EpubReaderActivity::openDictionaryWordSelect(int touchX, int touchY, TouchLongPressMode mode) {
   if (mode == TouchLongPressMode::Dictionary && SETTINGS.dictionaryName[0] == '\0') {
     pendingLookupSelection = {};
@@ -1297,7 +1355,8 @@ void EpubReaderActivity::openDictionaryWordSelect(int touchX, int touchY, TouchL
     ttf_->makeLayoutParams(renderer, params, automaticPageTurnActive);
     freeink::book::TtfWordSelectData data;
     if (params.font == nullptr ||
-        !freeink::book::buildTtfWordSelectData(page, *static_cast<freeink::book::FontChain*>(params.font), data)) {
+        !freeink::book::buildTtfWordSelectData(page, *static_cast<freeink::book::FontChain*>(params.font), data,
+                                               params.characterSpacingPx, params.wordSpacingPx)) {
       ttf_->scratch().release(scratchMark);
       LOG_ERR("ERS", "TTF dictionary: word extraction failed");
       showTtfDictionaryError();
@@ -1309,8 +1368,9 @@ void EpubReaderActivity::openDictionaryWordSelect(int touchX, int touchY, TouchL
     ttf_->scratch().release(scratchMark);
 
     const DictionaryWordSelectActivity::PageRenderFn renderFn{this, &EpubReaderActivity::renderTtfSelectorPage};
-    auto selector = makeUniqueNoThrow<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(data), renderFn,
-                                                                    touchX, touchY, mode);
+    auto selector = makeUniqueNoThrow<DictionaryWordSelectActivity>(
+        renderer, mappedInput, std::move(data), renderFn, touchX, touchY, mode, std::string{},
+        ttfVocabularyContext(static_cast<uint16_t>(ttfPage)));
     if (!selector) {
       LOG_ERR("ERS", "OOM: dictionary word selector");
       showTtfDictionaryError();
@@ -1443,9 +1503,28 @@ void EpubReaderActivity::startClipSelection(const int initialX, const int initia
       }
       int top, right, bottom, left;
       renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+      std::string chapter = chapterTitle;
+      if (section && currentSpineIndex == spineIndex) {
+        // TOC anchors are indexed by rendered page, not by the selected word's offset.
+        // Multiple chapter anchors on one page cannot be distinguished here.
+        const int selectedTocIndex = section->getTocIndexForPage(startPage);
+        if (selectedTocIndex >= 0) chapter = epub->getTocItem(selectedTocIndex).title;
+      }
+      VocabularyContext vocabulary;
+      vocabulary.title = std::move(bookTitle);
+      vocabulary.author = std::move(author);
+      vocabulary.chapter = std::move(chapter);
+      vocabulary.page = startPage + 1;
+      vocabulary.spine = spineIndex;
+      vocabulary.startOffset = clipping.startOffset;
+      ensureVocabularyMetadata();
+      if (vocabularyMetadata) {
+        vocabulary.series = vocabularyMetadata->series;
+        vocabulary.seriesIndex = vocabularyMetadata->seriesIndex;
+      }
       auto lookup = makeUniqueNoThrow<DictionaryWordSelectActivity>(
           renderer, mappedInput, std::move(page), left + SETTINGS.screenMargin, top + SETTINGS.screenMargin, -1, -1,
-          TouchLongPressMode::Dictionary, clipping.text);
+          TouchLongPressMode::Dictionary, clipping.text, std::move(vocabulary));
       if (!lookup) {
         LOG_ERR("CLIP", "OOM: dictionary lookup activity");
         requestUpdate();
@@ -1788,6 +1867,7 @@ void EpubReaderActivity::loop() {
   }
 
   switch (mappedInput.homeButtonAction()) {
+    case HomeButtonAction::FileBrowser:
     case HomeButtonAction::ReaderMenu:
     case HomeButtonAction::Bookmark:
     case HomeButtonAction::Sync:
@@ -2306,6 +2386,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           // behind on SD.
 #if defined(CROSSPOINT_TTF_READER)
           stopFibpWorker();
+          stopImagePredecode();
           if (ttf_) {
             ttf_->close();
           }
@@ -2420,6 +2501,12 @@ unsigned long EpubReaderActivity::confirmLongPressThreshold() const {
 }
 
 bool EpubReaderActivity::launchKOReaderSync() {
+#if defined(CROSSPOINT_TTF_READER)
+  // Stop the image worker BEFORE any path below can release epub: the sync
+  // flow resets the book mid-session and the worker dereferences it through
+  // its raw copy (decodeAndCache → extractItemToPsram). Bounded join.
+  stopImagePredecode();
+#endif
   flushReaderSession();
 
   // Without a KOReader server the sync activity only brings the device online
@@ -2902,6 +2989,37 @@ bool EpubReaderActivity::skipLoopDelay() {
   return overlay == Overlay::None && !buildHeapPaused && backgroundBuildWanted();
 }
 
+// Content viewport shared arithmetic (soak finding 1): getOrientedViewableTRBL
+// + screen margins + status-bar/auto-turn bottom rule. renderBook() (legacy)
+// and renderBookTtf() both assign buildViewport through this helper so the
+// members keep ONE meaning — the geometry the current layout pass actually
+// painted into — instead of per-path copies of the same expression.
+EpubReaderActivity::ContentMargins EpubReaderActivity::assignBuildViewport() {
+  ContentMargins margins{};
+  renderer.getOrientedViewableTRBL(&margins.top, &margins.right, &margins.bottom, &margins.left);
+  margins.top += SETTINGS.screenMargin;
+  margins.left += SETTINGS.screenMargin;
+  margins.right += SETTINGS.screenMargin;
+
+  const uint8_t statusBarHeight = UITheme::getReaderStatusBarHeight();
+
+  if (automaticPageTurnActive &&
+      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
+    margins.bottom +=
+        SETTINGS.screenMargin + statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin;
+  } else {
+    // statusBarOffsetY lowers the status line toward the edge; the text follows it down.
+    const int statusLane = SETTINGS.statusBarSpec().textLaneVisible(true)
+                               ? std::max(0, statusBarHeight - BoardConfig::ACTIVE.statusBarOffsetY)
+                               : statusBarHeight;
+    margins.bottom += SETTINGS.screenMargin + statusLane;
+  }
+
+  buildViewportWidth = static_cast<uint16_t>(renderer.getScreenWidth() - margins.left - margins.right);
+  buildViewportHeight = static_cast<uint16_t>(renderer.getScreenHeight() - margins.top - margins.bottom);
+  return margins;
+}
+
 void EpubReaderActivity::renderBook() {
 #if defined(CROSSPOINT_TTF_READER)
   // Native-TTF page source (design §3.5): a fully separate render path so the
@@ -2949,30 +3067,8 @@ void EpubReaderActivity::renderBook() {
     return;
   }
 
-  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-                                   &orientedMarginLeft);
-  orientedMarginTop += SETTINGS.screenMargin;
-  orientedMarginLeft += SETTINGS.screenMargin;
-  orientedMarginRight += SETTINGS.screenMargin;
-
-  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-
-  if (automaticPageTurnActive &&
-      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
-    orientedMarginBottom +=
-        std::max(SETTINGS.screenMargin,
-                 static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
-  } else {
-    orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
-  }
-
-  const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
-  const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
-  buildViewportWidth = viewportWidth;
-  buildViewportHeight = viewportHeight;
-
-  const ReaderRenderSpec renderSpec = SETTINGS.readerRenderSpec(viewportWidth, viewportHeight);
+  const ContentMargins margins = assignBuildViewport();
+  const ReaderRenderSpec renderSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);
 
   if (!section) {
     // Chapter changed or first load — clear stale prefetch
@@ -3310,7 +3406,7 @@ void EpubReaderActivity::renderBook() {
     uint32_t render_start_ms = millis();
     uint32_t psram_free_before_r = ESP.getFreePsram();
     uint32_t heap_free_before_r = ESP.getFreeHeap();
-    renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+    renderContents(std::move(p), margins.top, margins.right, margins.bottom, margins.left);
     uint32_t psram_free_after_r = ESP.getFreePsram();
     uint32_t heap_free_after_r = ESP.getFreeHeap();
     uint32_t render_end_ms = millis();
@@ -3320,7 +3416,7 @@ void EpubReaderActivity::renderBook() {
     LOG_DBG("ERS", "Rendered page in %dms", render_end_ms - render_start_ms);
 #else
     const auto start = millis();
-    renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+    renderContents(std::move(p), margins.top, margins.right, margins.bottom, margins.left);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
 #endif
     lastRenderCompleteMs = millis();
@@ -3739,6 +3835,21 @@ bool EpubReaderActivity::ttfResolveTargetPage(int& targetOut, const freeink::boo
 
 void EpubReaderActivity::renderBookTtf() {
   if (!epub || !ttf_) return;
+#if defined(CROSSPOINT_TTF_READER) && defined(BOARD_HAS_PSRAM)
+  // Foreground-activity pause (§5.7 rule 1): the image worker checks this
+  // between jobs, so a page render + display holds the bus against
+  // background SD reads for the whole pass. RAII so every early return
+  // re-arms the worker.
+  struct ForegroundBusy {
+    ImagePredecodeWorker* w;
+    explicit ForegroundBusy(ImagePredecodeWorker* p) : w(p) {
+      if (w != nullptr) w->setForegroundBusy(true);
+    }
+    ~ForegroundBusy() {
+      if (w != nullptr) w->setForegroundBusy(false);
+    }
+  } fgBusy{imagePredecode_.get()};
+#endif
 #if CROSSPOINT_TTF_UI_FALLBACK
   // makeLayoutParams() below can reload the shared font loader on this render
   // (first render after boot: the session's first selectFamily() dirties it),
@@ -3823,6 +3934,11 @@ void EpubReaderActivity::renderBookTtf() {
   }
 
   // 1) Layout params + generation for the current geometry/settings state.
+  // Soak finding 1: the TTF layout uses exactly the same oriented-margin
+  // arithmetic as makeLayoutParams/renderBook(), and buildViewport must be
+  // written by every render path that lays out a page (prerender and
+  // fast-display passes included).
+  assignBuildViewport();
   freeink::book::LayoutParams params;
   ttf_->makeLayoutParams(renderer, params, automaticPageTurnActive);
   if (params.font == nullptr) {
@@ -3842,6 +3958,9 @@ void EpubReaderActivity::renderBookTtf() {
   const uint32_t generation = freeink::book::layoutGenerationHash(params, freeink::book::fontLoader.fontFingerprint());
   ttfGeneration = generation;
   ttfGenerationValid = true;
+  // Image predecode follows the layout generation: queued jobs not matching
+  // are dropped at dequeue (their .pxc identity would be stale).
+  if (imagePredecode_ != nullptr) imagePredecode_->notifyGeneration(generation);
   // Index-ahead worker: spawn/notify under the current generation + chapter.
   updateFibpWorker(generation, params);
 
@@ -4432,10 +4551,15 @@ void EpubReaderActivity::ttfCommitFrame(const freeink::book::Page& page, const f
     GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
   };
   // Same §11 Q7 predicate paintTtfPage used for the base pass above: images
-  // keep the 1bpp engine path (no plane bits), so the dual-plane block runs
-  // only for text-only AA pages on a panel whose controller supports the
-  // 4-level gray mode at all.
+  // keep the 1bpp engine path EXCEPT on absolute-capable panels (design
+  // 2026-11-08 §5.1), where the image page joins the plane walk through the
+  // legacy reader's absolute arm — same predicate, plus the quality path
+  // (the revert switch keeps today's 1bpp image display verbatim).
   const bool pageHasImages = page.imageCount > 0 && SETTINGS.imageRendering == CrossPointSettings::IMAGES_DISPLAY;
+  // One shared predicate (design 2026-11-08 §5.1): the same decision
+  // paintCapturedPage's base style follows — base paint and commit cannot
+  // disagree within a pass (settings/controller are frozen for the render).
+  const bool absoluteImageGray = ttfAbsoluteImageGray(renderer, pageHasImages);
   const auto grayCaps = renderer.grayscaleCapabilities();
   // Degrade-aware: a build without the mono module paints Smooth planes even
   // when the setting asks for Crisp (the loader degraded the faces).
@@ -4445,9 +4569,9 @@ void EpubReaderActivity::ttfCommitFrame(const freeink::book::Page& page, const f
   const bool smoothText = SETTINGS.textRenderMode == CrossPointSettings::TEXT_RENDER_SMOOTH;
 #endif
   const bool grayParity = smoothText && !pageHasImages && grayCaps.supported();
-  LOG_DBG("GRS", "ttfGrayPath: aa=%d images=%d strip=%d cadence=%d/%d", grayParity, pageHasImages,
-          grayCaps.stripUploads, pagesUntilFullRefresh, SETTINGS.getRefreshFrequency());
-  if (grayParity) {
+  LOG_DBG("GRS", "ttfGrayPath: aa=%d images=%d absolute=%d strip=%d cadence=%d/%d", grayParity, pageHasImages,
+          absoluteImageGray, grayCaps.stripUploads, pagesUntilFullRefresh, SETTINGS.getRefreshFrequency());
+  if (grayParity || absoluteImageGray) {
     // §11 Q7 construction (a): dual-plane gray parity. Base refresh ordering
     // mirrors the legacy AA path: cleanup cycle when due, otherwise the
     // grayscale base waveform; then the plane walks, the gray display, and
@@ -4456,9 +4580,13 @@ void EpubReaderActivity::ttfCommitFrame(const freeink::book::Page& page, const f
     // advertises Overlay gray with stripUploads=false — the full planes go
     // through the same driver's full-plane upload, not a strip flag flip).
     LOG_DBG("GRS", "ttf gray route: transport=%s pagesUntilFullRefresh=%d refreshFrequency=%d images=%d",
-            grayCaps.stripUploads ? "strips" : "full-frame", pagesUntilFullRefresh, SETTINGS.getRefreshFrequency(),
-            pageHasImages);
-    if (grayCaps.stripUploads) {
+            absoluteImageGray       ? "absolute-image"
+            : grayCaps.stripUploads ? "strips"
+                                    : "full-frame",
+            pagesUntilFullRefresh, SETTINGS.getRefreshFrequency(), pageHasImages);
+    if (absoluteImageGray) {
+      renderTtfImageGrayAbsolute(page, params, scratchMark);
+    } else if (grayCaps.stripUploads) {
       renderTtfGrayStrips(page, params, scratchMark);
     } else {
       renderTtfGrayFullFrame(page, params, scratchMark);
@@ -4935,10 +5063,93 @@ void EpubReaderActivity::renderTtfGrayFullFrame(const freeink::book::Page& page,
 #endif
 }
 
+void EpubReaderActivity::renderTtfImageGrayAbsolute(const freeink::book::Page& page,
+                                                    const freeink::book::LayoutParams& params, size_t scratchMark) {
+  (void)scratchMark;  // released by the caller after this walk
+#ifdef BOOK_PROFILE
+  const unsigned long renderStartMs = millis();
+#endif
+  // Image page on an absolute-capable panel (design 2026-11-08 §5.1): the
+  // legacy reader's absolute arm — the base display consumes the painted
+  // framebuffer, then the page content is re-walked once per plane with the
+  // framebuffer as the plane source (seeded 0xFF; cleared bit = dark). Text
+  // goes through PagePaint's absolute tone sink, images through the same
+  // cache blit / foreground decode the base pass used — the writer picks up
+  // the absolute plane semantics from the renderer's mode, so worker and
+  // foreground parity is unchanged.
+  const auto baseMode = pagesUntilFullRefresh <= 1 ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+  if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, baseMode)) {
+    LOG_ERR("ERS", "Could not start absolute image page; displaying B/W");
+    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+    return;
+  }
+  LOG_DBG("ERS", "TTF image page: absolute quality waveform");
+  pagesUntilFullRefresh = 1;
+
+  if (!renderer.storeBwBuffer()) {
+    // The plane passes overwrite the framebuffer; without the stored base
+    // they cannot be undone — cancel the absolute pass, keep the base.
+    LOG_ERR("ERS", "Failed to store BW buffer for absolute image page; keeping B/W base");
+    renderer.setRenderMode(GfxRenderer::BW);
+    return;
+  }
+
+  const auto paintPlanePass = [&](const bool msbPass) {
+    // Seed both planes' white; the walk clears each plane's dark bits.
+    renderer.clearScreen(0xFF);
+    renderer.setRenderMode(msbPass ? GfxRenderer::GRAYSCALE_MSB : GfxRenderer::GRAYSCALE_LSB);
+    paintCapturedPage(page, params.font, renderer, *ttf_, params.characterSpacingPx, params.wordSpacingPx,
+                      msbPass ? TtfPaintPass::PlaneMsb : TtfPaintPass::PlaneLsb);
+    // The status bar is part of the absolute planes too (legacy parity): the
+    // plane upload replaces the whole frame, the base's chrome would vanish.
+    renderStatusBar();
+    if (msbPass) {
+      renderer.copyGrayscaleMsbBuffers();
+    } else {
+      renderer.copyGrayscaleLsbBuffers();
+    }
+  };
+#ifdef BOOK_PROFILE
+  const unsigned long tBaseMs = millis();
+#endif
+  paintPlanePass(false);
+#ifdef BOOK_PROFILE
+  const unsigned long tLsbMs = millis();
+#endif
+  paintPlanePass(true);
+#ifdef BOOK_PROFILE
+  const unsigned long tMsbMs = millis();
+#endif
+
+  // displayGrayBuffer BEFORE setRenderMode(BW) — the legacy arm's exact
+  // order: setRenderMode(BW) while absoluteGrayPlanes is set cancels the
+  // unfinished absolute pass (cleanupGrayscaleBuffers(nullptr)), which would
+  // drop every image page's gray planes.
+  renderer.displayGrayBuffer();
+#ifdef BOOK_PROFILE
+  const unsigned long tGrayMs = millis();
+#endif
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.restoreBwBuffer();
+#ifdef BOOK_PROFILE
+  LOG_DBG("PROF", "phase=ttf_gray_absolute base=%lums lsb=%lums msb=%lums gray=%lums total=%lums",
+          tBaseMs - renderStartMs, tLsbMs - tBaseMs, tMsbMs - tLsbMs, tGrayMs - tMsbMs, millis() - renderStartMs);
+#endif
+}
+
 void EpubReaderActivity::paintTtfPage(const freeink::book::Page& page, void* font, const int16_t characterSpacingPx,
                                       const int16_t wordSpacingPx) {
   if (!ttf_) return;
   paintCapturedPage(page, font, renderer, *ttf_, characterSpacingPx, wordSpacingPx);
+  // Image sighting (§5.2): AFTER the paint so the first view never waits on
+  // it. The first paint after a cache (re)open or a chapter switch sights the
+  // full current + next spine once per (spine, generation); the worker's
+  // enqueue dedupe makes re-sights cheap, and the build-tick sightings cover
+  // the prefix that has appeared since. Scratch mark discipline keeps the
+  // nested readPage() reads below the caller's live page mark.
+#if defined(CROSSPOINT_TTF_READER) && defined(BOARD_HAS_PSRAM)
+  ttfSightingPass();
+#endif
 }
 
 void EpubReaderActivity::renderTtfSelectorPage(void* ctx, GfxRenderer& renderer) {
@@ -4960,8 +5171,174 @@ void EpubReaderActivity::renderTtfSelectorPage(void* ctx, GfxRenderer& renderer)
   self->ttf_->scratch().release(scratchMark);
 }
 
+void EpubReaderActivity::stopImagePredecode() {
+  if (imagePredecode_ == nullptr) return;
+  if (imagePredecode_->cancel()) {
+    imagePredecode_.reset();
+  } else {
+    // Wedged join: the worker object owns state a live task still touches —
+    // release ownership WITHOUT destroying (leak beats use-after-free, the
+    // stopFibpWorker contract). The worker still dereferences epub_/source_
+    // raw, so the destructor keeps the book objects alive with it.
+    LOG_ERR("ERS", "Image predecode worker did not stop — releasing without destroy");
+    (void)imagePredecode_.release();
+    imagePredecodeLeaked_ = true;
+  }
+  imagePredecodeBegun_ = false;
+  ttfImagesSightedSpine_ = 0xFFFF;
+  ttfImagesSightedGen_ = 0;
+  ttfSightedPageCount_ = 0;
+  ttfSightCursorSpine_ = 0xFFFF;
+  ttfSightCursorGen_ = 0;
+  ttfSightCursorPage_ = 0;
+  ttfSightCursorNext_ = false;
+}
+
+// One bounded sighting walk (§5.2): up to kSightPagesPerPaint page records
+// across the current + next spine. Runs from the paint path AND the idle
+// build tick — a fast-turn run never reaches the paint-time walk (the fast
+// display pass serves image-free pages from the prerender), so the idle
+// drain keeps the cursor moving while the user speed-reads text.
+bool EpubReaderActivity::ttfSightingPass() {
+#if defined(CROSSPOINT_TTF_READER) && defined(BOARD_HAS_PSRAM)
+  if (!ttf_ || !ttf_->cacheReady() || imagePredecode_ == nullptr || !imagePredecodeBegun_) return true;
+  const bool sighted = ttfImagesSightedSpine_ == currentSpineIndex && ttfImagesSightedGen_ == ttfGeneration;
+  const uint16_t curCount = static_cast<uint16_t>(ttf_->availablePageCount(static_cast<uint16_t>(currentSpineIndex)));
+  // Same-generation cache growth (FIBP worker commits): re-arm after the
+  // already-sighted prefix instead of treating the spine as done.
+  const bool extended = sighted && ttfSightedPageCount_ != 0xFFFF && curCount > ttfSightedPageCount_;
+  if (sighted && !extended) return true;
+  if (ttfSightCursorSpine_ != currentSpineIndex || ttfSightCursorGen_ != ttfGeneration || extended) {
+    ttfSightCursorSpine_ = static_cast<uint16_t>(currentSpineIndex);
+    ttfSightCursorGen_ = ttfGeneration;
+    // A fresh pass starts at the restored reading position — pages behind it
+    // are skipped anyway; an extension resumes after the sighted prefix.
+    ttfSightCursorPage_ = sighted ? ttfSightedPageCount_ : (ttfPage > 0 ? static_cast<uint16_t>(ttfPage) : 0);
+    ttfSightCursorNext_ = false;
+  }
+  const uint16_t curSpine = static_cast<uint16_t>(currentSpineIndex);
+  const uint16_t nextSpine = static_cast<uint16_t>(currentSpineIndex + 1);
+  uint16_t budget = kSightPagesPerPaint;
+  bool done = false;
+  while (budget > 0) {
+    if (!ttfSightCursorNext_) {
+      const uint16_t pageCount = static_cast<uint16_t>(ttf_->availablePageCount(curSpine));
+      if (ttfSightCursorPage_ >= pageCount) {
+        if (!ttf_->prefetchFor(nextSpine)) {
+          done = true;  // no prefetch reader for the next spine: on-demand as today
+          break;
+        }
+        ttfSightCursorNext_ = true;
+        ttfSightCursorPage_ = 0;
+        continue;
+      }
+      uint16_t take = pageCount - ttfSightCursorPage_;
+      if (take > budget) take = budget;
+      const uint16_t got =
+          sightTtfSpineImages(curSpine, ttfSightCursorPage_, static_cast<uint16_t>(ttfSightCursorPage_ + take));
+      ttfSightCursorPage_ = static_cast<uint16_t>(ttfSightCursorPage_ + got);
+      budget = static_cast<uint16_t>(budget - got);
+      if (got < take) break;  // failed read: retry that page on a later pass
+      continue;
+    }
+    // Next-spine phase; the prefetch reader must still be alive.
+    if (!ttf_->prefetchFor(nextSpine)) {
+      done = true;  // reader dropped mid-pass: sighted what ran, rest on-demand
+      break;
+    }
+    const uint16_t nextCount = static_cast<uint16_t>(ttf_->prefetchPageCount());
+    if (ttfSightCursorPage_ >= nextCount) {
+      done = true;
+      break;
+    }
+    uint16_t take = nextCount - ttfSightCursorPage_;
+    if (take > budget) take = budget;
+    const uint16_t got =
+        sightTtfSpineImages(nextSpine, ttfSightCursorPage_, static_cast<uint16_t>(ttfSightCursorPage_ + take));
+    ttfSightCursorPage_ = static_cast<uint16_t>(ttfSightCursorPage_ + got);
+    budget = static_cast<uint16_t>(budget - got);
+    if (got < take) break;  // failed read: retry that page on a later pass
+  }
+  if (done) {
+    ttfImagesSightedSpine_ = curSpine;
+    ttfImagesSightedGen_ = ttfGeneration;
+    ttfSightedPageCount_ = static_cast<uint16_t>(ttf_->availablePageCount(curSpine));
+  }
+  return done;
+#else
+  return true;
+#endif  // CROSSPOINT_TTF_READER && BOARD_HAS_PSRAM
+}
+
+// Sight image records from a spine's .fibp page cache into the worker
+// (§5.2): pages [firstPage, endPageExclusive) in reading order. One worker;
+// per-record bounds checks mirror the paint path's. Zero-cache policy skips
+// the whole pass (the legacy path decodes nothing for GIF/BMP and no
+// JPEG/PNG caches are written). Works over the chapter-cache reader or the
+// prefetch reader for the next spine. Returns the pages whose records were
+// fully processed: a failed page read stops the pass there so a cursor
+// caller retries it instead of skipping the rest of the batch.
+uint16_t EpubReaderActivity::sightTtfSpineImages(const uint16_t spineIndex, const uint16_t firstPage,
+                                                 const uint16_t endPageExclusive) {
+#if defined(CROSSPOINT_TTF_READER) && defined(BOARD_HAS_PSRAM)
+  if (imagePredecode_ == nullptr || !imagePredecodeBegun_ || ttf_ == nullptr) return 0;
+  if (SETTINGS.imageRendering != CrossPointSettings::IMAGES_DISPLAY) return 0;
+  // Quality off writes no tone caches at all: the whole pass would only
+  // spend SD reads on jobs decodeAndCache skips at the kind check.
+  if (SETTINGS.imageDecodeQuality == 0) return 0;
+  if (endPageExclusive <= firstPage) return 0;
+
+  const uint32_t generation = ttfGeneration;
+  uint16_t processed = 0;
+  for (uint16_t p = firstPage; p < endPageExclusive; ++p) {
+    // Pages behind the reading position matter only when the user pages back
+    // (that decodes on demand exactly as today, §5.2 reading-order scope).
+    if (spineIndex == currentSpineIndex && ttfPage >= 0 && static_cast<int>(p) < ttfPage) {
+      ++processed;  // deliberately skipped: the cursor consumes the page
+      continue;
+    }
+    const size_t scratchMark = ttf_->scratch().mark();
+    freeink::book::Page page{};
+    if (!ttf_->readPage(spineIndex, p, &page)) {
+      ttf_->scratch().release(scratchMark);
+      break;  // retry this page on a later pass
+    }
+    for (uint16_t m = 0; m < page.imageCount; ++m) {
+      const freeink::book::PageImage& img = page.images[m];
+      ttfimg::ImageSpec spec{};
+      if (img.href == nullptr || strlen(img.href) >= ttfimg::ImageSpec::kHrefCap) {
+        LOG_DBG("ERS", "Image sighting href too long (spine %d page %d)", spineIndex, p);
+        continue;
+      }
+      snprintf(spec.href, sizeof(spec.href), "%s", img.href);
+      spec.generation = generation;
+      spec.spine = spineIndex;
+      spec.page = p;
+      spec.imgIdx = m;
+      spec.x = img.x;
+      spec.y = img.y;
+      spec.w = static_cast<int16_t>(img.width);
+      spec.h = static_cast<int16_t>(img.height);
+      spec.orientation = static_cast<uint8_t>(renderer.getOrientation());
+      imagePredecode_->enqueue(spec);
+    }
+    ttf_->scratch().release(scratchMark);
+    ++processed;
+  }
+  return processed;
+#else
+  return 0;
+#endif  // CROSSPOINT_TTF_READER && BOARD_HAS_PSRAM
+}
+
 void EpubReaderActivity::ttfBackgroundBuildTick() {
   if (!ttf_) return;
+#if defined(CROSSPOINT_TTF_READER) && defined(BOARD_HAS_PSRAM)
+  // Idle sighting drain (§5.2): fast turns serve image-free pages from the
+  // prerender and skip the paint-time walk; advance the same bounded cursor
+  // here so predecode keeps up while the user speed-reads text.
+  ttfSightingPass();
+#endif
   if (ttf_->sessionActive()) {
     const uint16_t spine = ttf_->sessionSpine();
     const uint16_t before = ttf_->availablePageCount(spine);
@@ -4980,6 +5357,11 @@ void EpubReaderActivity::ttfBackgroundBuildTick() {
     LOG_INF("ERS", "bg build spine %u: %u pages (%+d, %lu ms)", spine, after,
             static_cast<int32_t>(after) - static_cast<int32_t>(before),
             static_cast<unsigned long>(millis() - tickStart));
+    // Image sightings ride on committed page ranges (§5.2, build branch):
+    // the freshly laid-out pages of whichever spine the session serves.
+    if (after > before) {
+      sightTtfSpineImages(spine, before, after);
+    }
     powerManager.pokeNormalSpeed();
     if (!ttf_->sessionActive()) {  // finished (or failed) in this tick
       if (spine == static_cast<uint16_t>(currentSpineIndex)) {
@@ -4988,10 +5370,15 @@ void EpubReaderActivity::ttfBackgroundBuildTick() {
         requestUpdate();
       } else {
         ttfPrefetchActive = false;
-        // The committed cache replaced the partial file the prefetch reader
-        // describes — drop it so the next tick reopens the complete cache
-        // instead of restarting a rebuild from the stale partial.
-        ttf_->dropPrefetch();
+        // Image sighting for the committed next spine: finishSession() has
+        // already dropped the prefetch reader, so reopen the committed cache
+        // for the sighting pass and drop it again — the next tick reopens
+        // the complete cache instead of restarting a rebuild from the stale
+        // partial.
+        if (ttf_->openPrefetch(spine, ttfGeneration)) {
+          sightTtfSpineImages(spine, 0, static_cast<uint16_t>(ttf_->prefetchPageCount()));
+          ttf_->dropPrefetch();
+        }
       }
     }
     return;
@@ -5428,6 +5815,7 @@ void EpubReaderActivity::rememberCurrentContentOffset() {
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
                                         const int orientedMarginLeft) {
+  const ReaderUtils::ReaderRefreshScope readerRefresh;
   const auto t0 = millis();
   const int fontId = SETTINGS.getReaderFontId();
   ImageBlock::clearRenderFailures();
@@ -5475,9 +5863,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool needsTextGrayscale = SETTINGS.textRenderMode == CrossPointSettings::TEXT_RENDER_SMOOTH;
 #endif
   const bool needsAnyGrayscale = needsTextGrayscale || (pageHasImages && !BoardConfig::isEegoA4());
-  const bool absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
-                                      display.getController() == HalDisplay::Controller::UC8279 &&
-                                      renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
+  const bool absoluteImageGrayscale =
+      pageHasImages && !gpio.deviceIsX3() &&
+      (display.getController() == HalDisplay::Controller::UC8279 || BoardConfig::isPicco()) &&
+      renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
   const auto grayscale = renderer.grayscaleCapabilities(absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute
                                                                                : HalDisplay::GrayscaleMode::Overlay);
   const bool tiledGrayscale = needsAnyGrayscale && grayscale.stripUploads;
@@ -5529,7 +5918,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
       return;
     }
-    LOG_DBG("ERS", "UC8279 image page: absolute quality waveform");
+    LOG_DBG("ERS", "Image page: absolute grayscale waveform");
     pagesUntilFullRefresh = 1;
   } else if (pageHasImages) {
     // Image pages use one base refresh before the grayscale pass. FAST leaves
@@ -5626,7 +6015,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       for (int y = 0; y < gh; y += STRIP_ROWS) {
         const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
         renderer.beginStripTarget(buf + static_cast<size_t>(y) * gwBytes, y, rows);
-        renderer.clearScreen(0x00);
+        renderer.clearScreen(absoluteImageGrayscale ? 0xFF : 0x00);
         renderGrayscalePass();
         renderer.endStripTarget();
       }
@@ -5666,8 +6055,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       }
       const auto tGrayWrite = millis();
 
-      renderer.setRenderMode(GfxRenderer::BW);
       renderer.displayGrayBuffer();
+      renderer.setRenderMode(GfxRenderer::BW);
       const auto tGrayDisplay = millis();
 
       renderer.cleanupGrayscaleWithFrameBuffer();
@@ -5726,12 +6115,13 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
                 "gray_display=%lums cleanup=%lums total=%lums",
                 tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayBoth - tDisplay,
                 tGrayDisplay - tGrayBoth, tCleanup - tGrayDisplay, tEnd - t0);
+
       } else {
         renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
         for (int y = 0; y < gh; y += STRIP_ROWS) {
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
           renderer.beginStripTarget(scratch.get(), y, rows);
-          renderer.clearScreen(0x00);
+          renderer.clearScreen(absoluteImageGrayscale ? 0xFF : 0x00);
           renderGrayscalePass();
           renderer.endStripTarget();
           renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
@@ -5742,15 +6132,15 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
         for (int y = 0; y < gh; y += STRIP_ROWS) {
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
           renderer.beginStripTarget(scratch.get(), y, rows);
-          renderer.clearScreen(0x00);
+          renderer.clearScreen(absoluteImageGrayscale ? 0xFF : 0x00);
           renderGrayscalePass();
           renderer.endStripTarget();
           renderer.writeGrayscalePlaneStrip(false, scratch.get(), y, rows);
         }
         const auto tGrayMsb = millis();
 
-        renderer.setRenderMode(GfxRenderer::BW);
         renderer.displayGrayBuffer();
+        renderer.setRenderMode(GfxRenderer::BW);
         const auto tGrayDisplay = millis();
 
         renderer.cleanupGrayscaleWithFrameBuffer();
@@ -5783,7 +6173,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
       if (!renderer.storeBwBuffer()) {
         LOG_ERR("ERS", "Failed to store BW buffer for grayscale render; skipping grayscale this page");
-        if (absoluteImageGrayscale) renderer.setRenderMode(GfxRenderer::BW);
+        if (absoluteImageGrayscale) {
+          renderer.setRenderMode(GfxRenderer::BW);
+          ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+        }
 #ifdef BOOK_PROFILE
         logOverflowSummary();
 #endif

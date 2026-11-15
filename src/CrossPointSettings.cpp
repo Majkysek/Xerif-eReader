@@ -111,6 +111,11 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   if (dictionaryName[0] != '\0') {
     doc["dictionaryName"] = dictionaryName;
   }
+  // Dynamic display-index settings (varies by board) are skipped by the
+  // generic persistence loop — save the power actions manually.
+  doc["shortPwrBtn"] = shortPwrBtn;
+  doc["doublePwrBtn"] = doublePwrBtn;
+
   // Language -- managed by LanguageSelectActivity, not in SettingsList.
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (language < getLanguageCount()) ? LANGUAGE_CODES[language] : "EN";
@@ -128,6 +133,10 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   // GT911 idle sleep toggle — not in SettingsList (no menu UI yet), persisted
   // manually so the owner can flip it without a rebuild.
   doc["touchIdleSleep"] = touchIdleSleep;
+  // TTF image decode quality revert switch — not in SettingsList either; the
+  // value selects the tone bake on new decode paths only (old caches stay
+  // valid under their own bake flag in the cache name).
+  doc["imageDecodeQuality"] = imageDecodeQuality;
 
   bleturner::writeJson(ble, doc);
 }
@@ -270,10 +279,14 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // Font family — uses dynamic getter/setter in SettingsList so the generic loop skips it.
   const uint8_t storedFontFamily = doc["fontFamily"] | STORED_NOTOSANS;
   fontFamily = NOTOSANS;
-
   // GT911 idle sleep toggle — not in SettingsList, load manually (bool-fold:
   // anything non-zero counts as enabled).
   touchIdleSleep = doc["touchIdleSleep"] | (uint8_t)1 ? 1 : 0;
+  // TTF image decode quality: anything non-zero counts as on (default on).
+  imageDecodeQuality = doc["imageDecodeQuality"] | (uint8_t)1 ? 1 : 0;
+  // pictureDetail (the Sharp/Enhanced CLAHE selector) was removed with the
+  // linear-light blue-noise bake (design 2026-11-13): the quality path has
+  // one bake, so a persisted pictureDetail value is simply ignored.
 
   // The old fork reused the tap/long-press keys with a different value catalog.
   // When that legacy group is present, discard its bytes and fall back to the
@@ -283,6 +296,15 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     homeButtonDoubleTapAction = static_cast<uint8_t>(HomeButtonAction::ReaderMenu);
     homeButtonLongPressAction = static_cast<uint8_t>(HomeButtonAction::ToggleFrontlight);
   }
+
+  // Power actions use board-specific display-index mappings and are skipped by
+  // the generic settings loop — load them manually. doublePwrBtn is upstream's
+  // action selector; settings written by older fork builds only carry the
+  // doubleClickPwrLight bool, which migrates (1 = frontlight, 0 = ignore).
+  shortPwrBtn = clamp(doc["shortPwrBtn"] | (uint8_t)SLEEP, (uint8_t)SHORT_PWRBTN_COUNT, (uint8_t)SLEEP);
+  doublePwrBtn =
+      clamp(doc["doublePwrBtn"] | (uint8_t)((doc["doubleClickPwrLight"] | (uint8_t)1) ? PWR_FRONTLIGHT : IGNORE),
+            (uint8_t)SHORT_PWRBTN_COUNT, (uint8_t)PWR_FRONTLIGHT);
 
   // SD card font family name — not in SettingsList, load manually
   const char* sfn = doc["sdFontFamilyName"] | "";

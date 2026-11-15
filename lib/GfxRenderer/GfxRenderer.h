@@ -34,6 +34,7 @@ enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 
 class GfxRenderer {
  public:
   enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB, GRAYSCALE_DUAL };
+  enum class DitherMode { Replace, PreserveInk };
 
   // Logical screen orientation from the perspective of callers
   enum Orientation {
@@ -141,7 +142,7 @@ class GfxRenderer {
   // physical row with head-mask / middle memset / tail-mask byte writes — no
   // per-pixel rotation, no per-pixel RMW.
   template <Color color>
-  void fillRectImpl(int x, int y, int width, int height) const;
+  void fillRectImpl(int x, int y, int width, int height, DitherMode mode = DitherMode::Replace) const;
 
  public:
   explicit GfxRenderer(HalDisplay& halDisplay)
@@ -150,6 +151,15 @@ class GfxRenderer {
 
   // Setup
   void begin();  // must be called right after display.begin()
+  // Setup against a caller-provided scratch framebuffer instead of the
+  // display's own buffer (background image predecode worker). Performs
+  // begin()'s geometry/framebuffer assignments but never touches the display
+  // and never registers memory-manager sinks: a scratch renderer owns no font
+  // caches, so it has nothing to donate to the evictable-cache registry.
+  // Returns false (renderer left inert) when the declared scratch geometry
+  // does not match the panel — the decode path must see the panel's true
+  // geometry for its output to match the foreground's.
+  bool beginWithScratch(uint8_t* buf, int width, int height, int bytesPerRow);
   void insertFont(int fontId, EpdFontFamily font);
   // Clears both the flash-font map and any SD-font registration for fontId.
   // Coupled to avoid dangling SdCardFont* in sdCardFonts_ when callers free
@@ -268,7 +278,8 @@ class GfxRenderer {
   // Compatibility queries for Overlay mode.
   bool supportsAsyncGrayscaleBase() const;
   // EXPERIMENTAL: Windowed update - display only a rectangular region
-  // void displayWindow(int x, int y, int width, int height) const;
+  // Repaint a B/W rectangle over retained gray pixels; false means the caller must use its normal paint.
+  bool displayRetainedGrayscaleOverlay(int x, int y, int width, int height, bool restore = false) const;
   void invertScreen() const;
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
@@ -332,7 +343,8 @@ class GfxRenderer {
                        bool roundTopRight, bool roundBottomLeft, bool roundBottomRight, bool state) const;
   void maskRoundedRectOutsideCorners(int x, int y, int width, int height, int radius, Color color = Color::White) const;
   void fillRect(int x, int y, int width, int height, bool state = true) const;
-  void fillRectDither(int x, int y, int width, int height, Color color) const;
+  // PreserveInk adds the pattern's black pixels without clearing existing ink.
+  void fillRectDither(int x, int y, int width, int height, Color color, DitherMode mode = DitherMode::Replace) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
@@ -358,6 +370,13 @@ class GfxRenderer {
   // without re-rendering the whole page.
   size_t readFramebufferRegion(int x, int y, int w, int h, uint8_t* dst, size_t dstCapacity) const;
   void writeFramebufferRegion(int x, int y, int w, int h, const uint8_t* src);
+  // Composite-inverse flip of a screen-coordinate region (same clipping and
+  // rotation walk as readFramebufferRegion): every pixel in the region takes
+  // its opposite level. Selection surfaces (word highlight, saved clips) run
+  // in BW, so the flip lands in the framebuffer; inside an active GRAYSCALE_DUAL
+  // strip target both plane scratches flip together. Single-plane strip passes
+  // (GRAYSCALE_LSB/MSB) never host selection — refusing there is a no-op.
+  void invertRegion(int x, int y, int w, int h) const;
 
   // Text
   // Layout may use advance-only SD font tables; rendered measurement includes kerning and ligatures.

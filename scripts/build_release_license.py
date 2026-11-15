@@ -56,7 +56,10 @@ def source_reference(directory: Path) -> str:
     # Registry installs carry .piopm; git deps may not (PIO version dependent),
     # so name every git dep in lib_deps explicitly instead of guessing.
     GIT_DEP_REFERENCES = {
-        "JPEGDEC": "See the JPEGDEC URL and commit in platformio.ini.",
+        # JPEGDEC is a symlink dep into the SDK's vendored submodule (no URL in
+        # platformio.ini): name the submodule and its pinned commit instead.
+        "JPEGDEC": "Vendored as the JPEGDEC 1.8.5 submodule in the FreeInk SDK "
+        "(commit 0e879642e5e68624687f9ade16d799a091298ec8).",
         "PNGdec": "See the PNGdec URL and commit in platformio.ini.",
         "AnimatedGIF": "See the AnimatedGIF URL and commit in platformio.ini.",
         "NimBLE-Arduino": "See the NimBLE-Arduino URL and commit in platformio.ini.",
@@ -106,6 +109,14 @@ def build_license(environment: str, repository: str, packages_dir: Path) -> str:
             text += section(f"licenses/{path.name}", path.read_text(encoding="utf-8"))
 
     dependencies = PROJECT_DIR / ".pio" / "libdeps" / environment
+    # Symlink deps (symlink:// in platformio.ini) are copies of SDK-vendored
+    # trees. The libdeps copy can lack top-level notice files (observed on the
+    # CI runner: PIO's install kept src/ but dropped JPEGDEC/LICENSE, breaking
+    # the v2.17.0 tag), so fall back to the canonical SDK-vendored checkout —
+    # the checkout actions/checkout submodules:recursive always materializes.
+    SYMLINK_DEP_FALLBACK_DIRS = {
+        "JPEGDEC": "freeink-sdk/libs/book/FreeInkBook/third_party/jpegdec",
+    }
     dependency_sources = []
     for name, filenames in LIBRARY_NOTICES.items():
         directory = dependency_dir(dependencies, name)
@@ -115,9 +126,15 @@ def build_license(environment: str, repository: str, packages_dir: Path) -> str:
         )
         text += section(f"{name}: source package", source_reference(directory))
         for filename in filenames:
+            notice_path = directory / filename
+            if not notice_path.is_file():
+                fallback = PROJECT_DIR / SYMLINK_DEP_FALLBACK_DIRS.get(name, "")
+                fallback_notice = fallback / filename
+                if fallback_notice.is_file():
+                    notice_path = fallback_notice
             text += section(
                 f"{name}/{filename}",
-                (directory / filename).read_text(encoding="utf-8-sig"),
+                notice_path.read_text(encoding="utf-8-sig"),
             )
         for path in sorted(directory.rglob("*")):
             if path.is_file() and path.name.upper() in {"LICENSE", "NOTICE", "COPYING"}:

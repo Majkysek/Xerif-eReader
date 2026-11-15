@@ -3,14 +3,141 @@
 #if defined(CROSSPOINT_TTF_READER)
 
 #include <BookTypes.h>
+#include <HalDisplay.h>
+#include <HalGPIO.h>
 #include <Logging.h>
 
 #include "BookFontLoader.h"
 #include "CrossPointSettings.h"
+#include "Epub/blocks/ImageDecodeGate.h"
+#include "TtfImageCache.h"
+#include "TtfImageEngine.h"
 #include "adapters/FrameTargetFactory.h"
 #include "adapters/PagePaint.h"
 #include "render/PageRenderer.h"
 #include "render/TtfFont.h"
+
+namespace {
+
+// Image step of the TTF paint (§5.4): cache hit tone-row blits, else the
+// same decode the worker runs (G3 parity — cache populated in the paint
+// fallback too), else (policy off) today's SDK-renderImages behavior by
+// construction.
+void paintTtfPageImages(const freeink::book::Page& page, freeink::book::TtfBookRuntime& ttf, GfxRenderer& renderer) {
+  const bool qualityTone = SETTINGS.imageDecodeQuality != 0;
+  // The Sharp/Enhanced CLAHE selector was removed with the linear-light
+  // blue-noise bake (design 2026-11-13): one quality bake, DPID resize
+  // always on, CLAHE stage off.
+  const bool clahe = false;
+  if (!qualityTone) {
+    // Revert switch: the previous image paint path verbatim.
+    const freeink::book::BookStatus st = freeink::book::PageRenderer::renderImages(
+        page, ttf.source(), ttf.catalog().zip(), ttf.scratch(), makeFrameTarget(renderer));
+    if (st != freeink::book::BookStatus::Ok) {
+      LOG_DBG("QPR", "TTF image render failed: %s", freeink::book::bookStatusName(st));
+    }
+    return;
+  }
+
+  const char* dir = ttf.cacheDir();
+  if (dir == nullptr || dir[0] == '\0') return;
+  for (uint16_t m = 0; m < page.imageCount; ++m) {
+    const freeink::book::PageImage& img = page.images[m];
+    if (img.href == nullptr || img.width == 0 || img.height == 0) continue;
+
+    ttfimg::ImageSpec spec{};
+    if (strlen(img.href) >= ttfimg::ImageSpec::kHrefCap) {
+      // An href past ImageSpec::kHrefCap cannot fit the spec's copy, but the
+      // cache identity is a hash of the string and the decode stack takes
+      // the href by pointer with no length cap: key it through hrefExt
+      // (paint-side only — the Page outlives all three passes here; worker
+      // sightings skip overlong hrefs and its queue stores specs by value,
+      // so no queued spec ever carries a pointer). Overlong images decode
+      // and cache like any other — plane-aware tones on every pass, gated
+      // like the rest (review round 3).
+      spec.hrefExt = img.href;
+    } else {
+      strncpy(spec.href, img.href, ttfimg::ImageSpec::kHrefCap - 1);
+    }
+    spec.generation = ttf.cacheGeneration();
+    spec.spine = ttf.cacheSpine();
+    spec.page = page.pageIndex;
+    spec.imgIdx = m;
+    spec.x = img.x;
+    spec.y = img.y;
+    spec.w = static_cast<int16_t>(img.width);
+    spec.h = static_cast<int16_t>(img.height);
+    spec.orientation = static_cast<uint8_t>(renderer.getOrientation());
+
+    if (ttfimg::hasValidCache(spec, dir, qualityTone, clahe) &&
+        ttfimg::blitFromCache(renderer, spec, dir, qualityTone, clahe)) {
+      continue;
+    }
+    // A cache hit that failed to blit (unreadable file, torn payload) falls
+    // through to the foreground decode: the same path a cache miss takes,
+    // repainting the placement area fully.
+
+    // First-write-cache (§5.4): the foreground decode populates the same
+    // tone cache the worker would have — single-writer gate first (§5.7
+    // rule 1); on gate timeout the space stays blank and a later pass
+    // retries, typically onto the worker's fresh cache.
+    char cachePath[256];
+    if (!ttfimg::cacheNameFor(spec, dir, qualityTone, clahe, cachePath, sizeof(cachePath))) continue;
+    const uint64_t hash = ImageDecodeGate::pathHash(cachePath);
+    if (!ImageDecodeGate::acquireForeground(hash)) continue;
+    // Decode bus: the worker yields its in-flight decode at the next band
+    // boundary (the per-image claim above already marked it); the bounded
+    // wait covers the band unwind. On timeout the space stays blank this
+    // pass and the next pass retries — never a stall on the loop task.
+    if (!ImageDecodeGate::acquireForegroundBus(500)) {
+      // The GateGuard below never ran: drop the per-image claim or it stays
+      // Owner::Foreground forever and fills the claim table.
+      ImageDecodeGate::releaseForeground(hash);
+      continue;
+    }
+    {
+      struct GateGuard {
+        uint64_t hash;
+        ~GateGuard() {
+          ImageDecodeGate::releaseForegroundBus();
+          ImageDecodeGate::releaseForeground(hash);
+        }
+      } guard{hash};
+      const size_t scratchMark = ttf.scratch().mark();
+      // Cold-decode arena parity (design amendment 7): a deflated full-page
+      // JPEG must not step down through the SDK's arena retry. The engine
+      // reserves the dedicated ttfimg::kDecodeArenaBytes fallback itself,
+      // AFTER its probe names the kind — GIF/BMP decoders pull their source
+      // into a separate PSRAM item buffer and must not be starved of PSRAM
+      // by a reserve they never use (review 2026-11-11). This PoolBytes only
+      // keeps the block alive for the call; the runtime scratch arena stays
+      // the decode arena whenever it is at or above the floor.
+      PoolBytes decodeArenaBytes;
+      const ttfimg::DecodeResult res = ttfimg::decodeAndCache(
+          spec, cachePath, ttf.source(), ttf.catalog().zip(), ttf.scratch(), ttf.decodeEpub(), &renderer, qualityTone,
+          /*caching=*/true, nullptr, nullptr, true, clahe, &decodeArenaBytes);
+      ttf.scratch().release(scratchMark);
+      if (res != ttfimg::DecodeResult::Ok) {
+        LOG_DBG("QPR", "TTF image decode: kind=%d %s", static_cast<int>(res),
+                spec.hrefExt != nullptr ? spec.hrefExt : spec.href);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+// Design 2026-11-08 §5.1: the absolute-gray image routing predicate — the
+// legacy reader's absoluteImageGrayscale arm (EpubReaderActivity render
+// contents) restricted to the quality path (the revert switch keeps today's
+// 1bpp image display verbatim), expressed through the host-tested pure
+// decision table in the ttfimg core.
+bool ttfAbsoluteImageGray(const GfxRenderer& renderer, const bool pageHasImages) {
+  return ttfimg::absoluteGrayImageRoute(
+      pageHasImages, SETTINGS.imageDecodeQuality != 0, gpio.deviceIsX3(),
+      display.getController() == HalDisplay::Controller::UC8279,
+      renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported());
+}
 
 QuickRelayoutResult quickRelayoutPage(freeink::book::TtfBookRuntime& ttf, GfxRenderer& renderer,
                                       const uint16_t spineIndex, const uint32_t anchorChar,
@@ -68,38 +195,55 @@ QuickRelayoutResult quickRelayoutPage(freeink::book::TtfBookRuntime& ttf, GfxRen
 
 void paintCapturedPage(const freeink::book::Page& page, void* font, GfxRenderer& renderer,
                        freeink::book::TtfBookRuntime& ttf, const int16_t characterSpacingPx,
-                       const int16_t wordSpacingPx) {
+                       const int16_t wordSpacingPx, const TtfPaintPass pass) {
   // §11 Q7 construction (a): with text AA engaged the paint goes via PagePaint
   // (the tone-1 boundary of the shared uniform quantizer) and a dual plane
   // walk supplies the two gray tones through the panel's AA waveform — the
-  // same 4-level pipeline the bitmap reader uses. Images keep the 1bpp
-  // engine path (no plane bits for image pixels).
+  // same 4-level pipeline the bitmap reader uses. Image pages join it on
+  // absolute-capable panels (design 2026-11-08 §5.1): the commit re-walks the
+  // content once per plane with the baked 4-level tones, so the page no
+  // longer forces the 1bpp engine path there. Panels without absolute gray
+  // keep the 1bpp image path (no plane bits for image pixels).
   const bool pageHasImages = page.imageCount > 0 && SETTINGS.imageRendering == CrossPointSettings::IMAGES_DISPLAY;
+  const bool absoluteImages = ttfAbsoluteImageGray(renderer, pageHasImages);
 #if defined(CROSSPOINT_FONT_BACKEND_FT) && CROSSPOINT_FONT_BACKEND_FT
   const bool smoothText = !freeink::book::fontLoader.effectiveMonochrome();
 #else
   const bool smoothText = SETTINGS.textRenderMode == CrossPointSettings::TEXT_RENDER_SMOOTH;
 #endif
-  const bool grayParity = smoothText && !pageHasImages && renderer.grayscaleCapabilities().supported();
+  const bool grayParity =
+      smoothText && (absoluteImages || !pageHasImages) && renderer.grayscaleCapabilities().supported();
   auto* chain = static_cast<freeink::book::FontChain*>(font);
-  if (grayParity) {
-    freeink::book::PagePaint::paintText(page, *chain, renderer, characterSpacingPx, wordSpacingPx);
-  } else {
-    const freeink::book::FrameTarget frameTarget = makeFrameTarget(renderer);
-    freeink::book::PageRenderer::renderText(page, *chain, frameTarget, nullptr, characterSpacingPx, wordSpacingPx);
-    // Ruby annotations are engine records — the same pass the engine's own
-    // render() runs; no CrossPoint layout involvement.
-    if (page.rubyCount > 0) {
-      freeink::book::PageRenderer::renderRubies(page, *chain, frameTarget);
+  if (pass == TtfPaintPass::Base) {
+    if (grayParity) {
+      freeink::book::PagePaint::paintText(page, *chain, renderer, characterSpacingPx, wordSpacingPx);
+    } else {
+      const freeink::book::FrameTarget frameTarget = makeFrameTarget(renderer);
+      freeink::book::PageRenderer::renderText(page, *chain, frameTarget, nullptr, characterSpacingPx, wordSpacingPx);
+      // Ruby annotations are engine records — the same pass the engine's own
+      // render() runs; no CrossPoint layout involvement.
+      if (page.rubyCount > 0) {
+        freeink::book::PageRenderer::renderRubies(page, *chain, frameTarget);
+      }
     }
+  } else {
+    // Absolute-gray plane pass: the 0xFF seed is white; the walk clears each
+    // plane's bit where the tone's absolute encoding is dark (tone 1 → LSB,
+    // tone 2 → MSB, tone 3 → both). Crisp-mode text keeps its binary ink in
+    // the planes (no AA bands) — the base's crisp ink must survive the plane
+    // upload (review round 2).
+    freeink::book::PagePaint::paintTextAbsolutePlanes(page, *chain, renderer, pass == TtfPaintPass::PlaneMsb,
+                                                      /*binaryText=*/!smoothText, characterSpacingPx, wordSpacingPx);
   }
   freeink::book::PageRenderer::renderRules(page, makeFrameTarget(renderer));
   if (pageHasImages) {
-    const freeink::book::BookStatus st = freeink::book::PageRenderer::renderImages(
-        page, ttf.source(), ttf.catalog().zip(), ttf.scratch(), makeFrameTarget(renderer));
-    if (st != freeink::book::BookStatus::Ok) {
-      LOG_DBG("QPR", "TTF image render failed: %s", freeink::book::bookStatusName(st));
-    }
+    // The base snapshot consumed by the absolute base display carries the
+    // image as a Bayer dither (legacy parity); the plane passes overwrite the
+    // rect with the baked 4-level tones through the same writer.
+    const bool baseDither = absoluteImages && pass == TtfPaintPass::Base;
+    if (baseDither) renderer.setDitherImagesInBw(true);
+    paintTtfPageImages(page, ttf, renderer);
+    if (baseDither) renderer.setDitherImagesInBw(false);
   } else if (SETTINGS.imageRendering == CrossPointSettings::IMAGES_PLACEHOLDER) {
     // §3.5 item 11: image policy is CrossPoint-side; placeholder mode draws
     // the engine's reserved geometry as an outline instead of decoding.
